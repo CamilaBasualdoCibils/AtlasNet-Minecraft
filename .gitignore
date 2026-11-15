@@ -1,0 +1,10 @@
+# Local build tools and caches
+.tools/
+.gradle/
+**/build/
+**/run/
+.idea/
+*.iml
+.classpath
+.project
+.settings/
