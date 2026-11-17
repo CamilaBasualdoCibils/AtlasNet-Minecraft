@@ -60,6 +60,15 @@ final class LiveChunkHandoffs {
         return region != null && region.owns(chunk) && !frozen.contains(chunk) ? active.get(chunk) : null;
     }
 
+    boolean acceptsCollisionReplica(long chunk) {
+        return region != null && !region.owns(chunk) && !active.containsKey(chunk)
+                && !acquiring.contains(chunk) && !staging.contains(chunk) && !frozen.contains(chunk);
+    }
+
+    LevelChunk collisionReplica(long chunk) {
+        return loaded.get(chunk);
+    }
+
     boolean ownsPosition(double x, double z) {
         return region != null && region.contains(x, z);
     }

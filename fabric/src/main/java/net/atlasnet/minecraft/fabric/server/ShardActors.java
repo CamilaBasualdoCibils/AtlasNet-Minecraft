@@ -5,6 +5,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -12,27 +13,36 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.function.Function;
 import net.atlasnet.minecraft.atlasnet.protocol.signals.WorldActorSignal;
-import net.atlasnet.minecraft.fabric.mixin.ShardArrowCollisionAccessor;
+import net.atlasnet.minecraft.fabric.mixin.ShardProjectileCollisionAccessor;
 import net.atlasnet.minecraft.fabric.server.storage.ShardChunkIO;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.TicketType;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.projectile.AbstractArrow;
 import net.minecraft.world.entity.projectile.Arrow;
+import net.minecraft.world.entity.projectile.ItemSupplier;
+import net.minecraft.world.entity.projectile.ThrowableItemProjectile;
+import net.minecraft.world.entity.projectile.ThrownEnderpearl;
 import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.entity.projectile.ProjectileUtil;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
-/** Game-thread state for AtlasNet-managed Overworld items and arrows. */
+/** Game-thread state for AtlasNet-managed Overworld actors. */
 public final class ShardActors {
     private static final boolean ENABLED = Boolean.getBoolean("atlasnet.minecraft.liveTerrain");
     private static final int MAX_CHECKPOINT_BYTES = 24 * 1024;
+    private static final TicketType<Integer> PROJECTILE_HANDOFF =
+            TicketType.create("atlasnet_projectile_handoff", Integer::compare, 40);
     private static final HashMap<Integer, Actor> tracked = new HashMap<>();
     private static final Set<Integer> frozen = new HashSet<>();
     private static final Set<Integer> crossing = new HashSet<>();
@@ -43,13 +53,18 @@ public final class ShardActors {
 
     public static boolean managed(Entity entity) {
         return ENABLED && entity.level() instanceof ServerLevel level && level.dimension() == ServerLevel.OVERWORLD
-                && (entity instanceof ItemEntity || entity instanceof Arrow);
+                && (usesAtlasNetVisuals(entity) || entity instanceof Mob);
+    }
+
+    public static boolean usesAtlasNetVisuals(Entity entity) {
+        return entity instanceof ItemEntity || entity instanceof AbstractArrow
+                || (entity instanceof ThrowableItemProjectile && !(entity instanceof ThrownEnderpearl));
     }
 
     public static void track(Entity entity) {
         if (managed(entity)) {
             var actor = tracked.computeIfAbsent(entity.getId(), id -> new Actor(entity));
-            if (actor.shooter == null && entity instanceof Arrow arrow && arrow.getOwner() instanceof Player player) {
+            if (actor.shooter == null && entity instanceof Projectile projectile && projectile.getOwner() instanceof Player player) {
                 actor.shooter = player.getGameProfile();
             }
         }
@@ -57,14 +72,18 @@ public final class ShardActors {
 
     public static void untrack(Entity entity) {
         if (tracked.remove(entity.getId()) != null) {
-            frozen.remove(entity.getId());
-            crossing.remove(entity.getId());
-            frames.add(ByteBuffer.allocate(Integer.BYTES).putInt(entity.getId()).array());
+            retire(entity.getId());
         }
     }
 
+    private static void retire(int id) {
+        frozen.remove(id);
+        crossing.remove(id);
+        frames.add(ByteBuffer.allocate(Integer.BYTES).putInt(id).array());
+    }
+
     public static boolean frozen(Entity entity) {
-        return managed(entity) && (frozen.contains(entity.getId()) || crossing.contains(entity.getId()));
+        return managed(entity) && frozen.contains(entity.getId());
     }
 
     public static Player firingPlayer(Projectile projectile) {
@@ -79,23 +98,28 @@ public final class ShardActors {
     }
 
     static void sample() {
-        for (var entry : tracked.entrySet()) {
-            var actor = entry.getValue();
+        var iterator = tracked.values().iterator();
+        while (iterator.hasNext()) {
+            var actor = iterator.next();
             Entity entity = actor.entity;
             int id = entity.getId();
-            boolean owned = ShardChunkIO.ownsPosition(entity.getX(), entity.getZ());
-            if (owned) {
-                crossing.remove(id);
-            }
-            if (entity.isRemoved() || frozen(entity)) {
+            if (frozen(entity)) {
                 continue;
             }
+            if (entity.isRemoved() || (entity instanceof Mob && !entity.isAlive())) {
+                // Vanilla death animation can outlast entity-ticking demand.
+                iterator.remove();
+                retire(id);
+                continue;
+            }
+            boolean owned = ShardChunkIO.ownsPosition(entity.getX(), entity.getZ());
             if (!owned) {
                 crossing.add(id);
             } else {
+                crossing.remove(id);
                 actor.lastOwnedPosition = entity.position();
             }
-            byte[] item = actor.itemState();
+            byte[] item = actor.visualState();
             if (item == null) {
                 continue;
             }
@@ -103,7 +127,9 @@ public final class ShardActors {
                     .putInt(entity.getId()).putDouble(entity.getX()).putDouble(entity.getY()).putDouble(entity.getZ())
                     .putFloat(entity.getYRot()).putFloat(entity.getXRot())
                     .putLong(entity.getUUID().getMostSignificantBits()).putLong(entity.getUUID().getLeastSignificantBits())
-                    .put(entity instanceof ItemEntity ? WorldActorSignal.ITEM : WorldActorSignal.ARROW)
+                    .put(entity instanceof ItemEntity ? WorldActorSignal.ITEM
+                            : entity instanceof Arrow ? WorldActorSignal.ARROW
+                            : entity instanceof Projectile ? WorldActorSignal.PROJECTILE : 0)
                     .put(item).array();
             if (!Arrays.equals(frame, actor.previous)) {
                 actor.previous = frame;
@@ -126,7 +152,7 @@ public final class ShardActors {
 
     static byte[] freeze(int id) {
         var actor = tracked.get(id);
-        if (actor == null || actor.entity.isRemoved()) {
+        if (actor == null || actor.entity.isRemoved() || actor.entity.isPassenger() || actor.entity.isVehicle()) {
             return null;
         }
         var entity = actor.entity;
@@ -138,7 +164,7 @@ public final class ShardActors {
             tag.putUUID("AtlasNetShooter", actor.shooter.getId());
             tag.putString("AtlasNetShooterName", actor.shooter.getName());
         }
-        if (entity instanceof Arrow && crossing.contains(id)) {
+        if (entity instanceof Projectile && crossing.contains(id)) {
             tag.putDouble("AtlasNetFromX", actor.lastOwnedPosition.x());
             tag.putDouble("AtlasNetFromY", actor.lastOwnedPosition.y());
             tag.putDouble("AtlasNetFromZ", actor.lastOwnedPosition.z());
@@ -154,8 +180,12 @@ public final class ShardActors {
         var actor = tracked.get(id);
         frozen.remove(id);
         crossing.remove(id);
-        if (commit && actor != null) {
-            actor.entity.discard();
+        if (actor != null) {
+            if (commit) {
+                actor.entity.discard();
+            } else {
+                actor.previous = null;
+            }
         }
     }
 
@@ -187,21 +217,26 @@ public final class ShardActors {
             return 0;
         }
         var entity = checkpoint.entity;
-        if (!((ServerLevel) entity.level()).addFreshEntity(entity)) {
+        var level = (ServerLevel) entity.level();
+        if (!level.addFreshEntity(entity)) {
             return 0;
+        }
+        if (entity instanceof Projectile) {
+            level.getChunkSource().addRegionTicket(PROJECTILE_HANDOFF,
+                    entity.chunkPosition(), 2, entity.getId());
         }
         incoming.remove(transfer);
         // A newly loaded entity may start tracking later if its chunk is still
         // being promoted. Preserve its identity and shooter before collision.
         var actor = tracked.computeIfAbsent(entity.getId(), id -> new Actor(entity));
         actor.shooter = checkpoint.shooter;
-        if (entity instanceof Arrow arrow && checkpoint.start != null) {
-            var collision = (ShardArrowCollisionAccessor) arrow;
-            var end = arrow.position();
-            var hit = ProjectileUtil.getEntityHitResult(arrow.level(), arrow, checkpoint.start, end,
+        if (entity instanceof Projectile projectile && checkpoint.start != null) {
+            var collision = (ShardProjectileCollisionAccessor) projectile;
+            var end = projectile.position();
+            var hit = ProjectileUtil.getEntityHitResult(projectile.level(), projectile, checkpoint.start, end,
                     new AABB(checkpoint.start, end).inflate(1), collision::atlasnet$canHitEntity);
             if (hit != null) {
-                collision.atlasnet$hitEntity(hit);
+                collision.atlasnet$hit(hit);
             }
         }
         return entity.getId();
@@ -230,20 +265,41 @@ public final class ShardActors {
         GameProfile shooter;
         Player detachedShooter;
         ItemStack lastItem = ItemStack.EMPTY;
-        byte[] itemBytes = new byte[0];
+        final byte[] projectileType;
+        byte[] visualBytes;
 
         Actor(Entity entity) {
             this.entity = entity;
             lastOwnedPosition = entity.position();
+            projectileType = entity instanceof Projectile && !(entity instanceof Arrow)
+                    ? BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString()
+                            .getBytes(StandardCharsets.UTF_8)
+                    : new byte[0];
+            visualBytes = visualBytes(new byte[0]);
         }
 
-        byte[] itemState() {
-            if (entity instanceof ItemEntity drop && !ItemStack.matches(lastItem, drop.getItem())) {
-                lastItem = drop.getItem().copy();
-                itemBytes = encode((CompoundTag) lastItem.saveOptional(entity.registryAccess()),
-                        WorldActorSignal.MAX_ITEM_BYTES);
+        byte[] visualState() {
+            var current = entity instanceof ItemEntity drop ? drop.getItem()
+                    : entity instanceof ItemSupplier projectile ? projectile.getItem() : ItemStack.EMPTY;
+            if (!ItemStack.matches(lastItem, current)) {
+                lastItem = current.copy();
+                var item = lastItem.isEmpty() ? new byte[0]
+                        : encode((CompoundTag) lastItem.saveOptional(entity.registryAccess()),
+                                WorldActorSignal.MAX_ITEM_BYTES);
+                visualBytes = item == null ? null : visualBytes(item);
             }
-            return itemBytes;
+            return visualBytes;
+        }
+
+        private byte[] visualBytes(byte[] item) {
+            if (projectileType.length == 0) {
+                return item;
+            }
+            if (projectileType.length > WorldActorSignal.MAX_TYPE_BYTES) {
+                return null;
+            }
+            return ByteBuffer.allocate(1 + projectileType.length + item.length)
+                    .put((byte) projectileType.length).put(projectileType).put(item).array();
         }
     }
 

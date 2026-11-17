@@ -1,6 +1,8 @@
 package net.atlasnet.minecraft.fabric.mixin;
 
 import net.atlasnet.minecraft.fabric.server.ShardActors;
+import net.atlasnet.minecraft.fabric.server.ShardPlayers;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
@@ -14,7 +16,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 abstract class ShardActorPickupMixin {
     @Inject(method = "playerTouch", at = @At("HEAD"), cancellable = true)
     private void atlasnet$skipFrozenPickup(Player player, CallbackInfo callback) {
-        if (ShardActors.frozen((Entity) (Object) this)) {
+        if (ShardActors.frozen((Entity) (Object) this)
+                || (player instanceof ServerPlayer serverPlayer && ShardPlayers.inventoryReserved(serverPlayer))) {
             callback.cancel();
         }
     }

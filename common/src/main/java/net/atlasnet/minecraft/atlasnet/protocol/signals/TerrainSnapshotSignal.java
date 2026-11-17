@@ -3,10 +3,11 @@ package net.atlasnet.minecraft.atlasnet.protocol.signals;
 import java.nio.ByteBuffer;
 
 /** One fragment of an authoritative Minecraft chunk packet. */
-public record TerrainSnapshotSignal(long viewer, long sequence, int x, int z, int offset, int size, byte[] bytes) {
+public record TerrainSnapshotSignal(long viewer, long sourceHigh, long sourceLow, long sequence,
+                                    int x, int z, int offset, int size, byte[] bytes) {
     public static final int VIEWER_ID = 0x4d43010a;
     public static final int ID = 0x4d43010b;
-    private static final int HEADER_SIZE = 2 * Long.BYTES + 4 * Integer.BYTES;
+    private static final int HEADER_SIZE = 4 * Long.BYTES + 4 * Integer.BYTES;
     public static final int MAX_PACKET = 8 * 1024 * 1024;
 
     public static TerrainSnapshotSignal decode(byte[] payload) {
@@ -15,6 +16,8 @@ public record TerrainSnapshotSignal(long viewer, long sequence, int x, int z, in
         }
         var in = ByteBuffer.wrap(payload);
         long viewer = in.getLong();
+        long sourceHigh = in.getLong();
+        long sourceLow = in.getLong();
         long sequence = in.getLong();
         int x = in.getInt();
         int z = in.getInt();
@@ -25,6 +28,6 @@ public record TerrainSnapshotSignal(long viewer, long sequence, int x, int z, in
         }
         byte[] bytes = new byte[in.remaining()];
         in.get(bytes);
-        return new TerrainSnapshotSignal(viewer, sequence, x, z, offset, size, bytes);
+        return new TerrainSnapshotSignal(viewer, sourceHigh, sourceLow, sequence, x, z, offset, size, bytes);
     }
 }

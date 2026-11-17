@@ -1,7 +1,7 @@
 {
   "program": "${workspaceFolder}/../AtlasNet/build/AtlasNetNode",
   "cwd": "${workspaceFolder}/build",
-  "preLaunchCommand": "cmake -S \"${workspaceFolder}\" -B \"${workspaceFolder}/build\" -DATLASNET_MINECRAFT_SHARD_MODULE=ON && cmake --build \"${workspaceFolder}/build\" --target BuildServer && python3 \"${workspaceFolder}/scripts/minecraft-valkey.py\" start --stack-session",
+  "preLaunchCommand": "cmake -S \"${workspaceFolder}\" -B \"${workspaceFolder}/build\" -DATLASNET_MINECRAFT_SHARD_MODULE=ON && cmake --build \"${workspaceFolder}/build\" --target BuildServer && env MINECRAFT_TERRAIN_PRESET=normal python3 \"${workspaceFolder}/scripts/minecraft-valkey.py\" start --stack-session",
   "gdb": "${workspaceFolder}/scripts/minecraft-stack-gdb",
   "clusterPort": 42000,
   "handshakePort": 43000,
@@ -62,7 +62,7 @@
             "transport": "SteamNetSock",
             "port": 5919,
             "admission": "AllowAll",
-            "spawn": "Static(minecraft:overworld,-16:-60:0)"
+            "spawn": "Static(minecraft:overworld,-16:64:0)"
           }
         ]
       }
@@ -93,7 +93,7 @@
             "transport": "SteamNetSock",
             "port": 5920,
             "admission": "AllowAll",
-            "spawn": "Static(minecraft:overworld,-16:-60:0)"
+            "spawn": "Static(minecraft:overworld,-16:64:0)"
           }
         ]
       }

@@ -47,6 +47,7 @@ public:
     }
     if (readingOptions)
       throw std::runtime_error("Invalid Fabric shard launch configuration");
+    vmOptions.emplace_back("-Datlasnet.minecraft.shardProperties=" MINECRAFT_SHARD_PROPERTIES_FILE);
     if (valkeyTerrain)
       vmOptions.emplace_back("-Datlasnet.minecraft.valkeyTerrain=true");
     if (liveTerrain)
@@ -83,19 +84,6 @@ public:
     fs::create_directories(instance);
     if (fs::exists(shared / "eula.txt"))
       fs::copy_file(shared / "eula.txt", instance / "eula.txt", fs::copy_options::overwrite_existing);
-    if (!fs::exists(instance / "server.properties"))
-    {
-      std::ofstream settings(instance / "server.properties");
-      settings << "view-distance=5\nsimulation-distance=5\n";
-      if (normal)
-        settings << "level-type=minecraft:normal\n";
-      else
-        settings << "level-type=minecraft:flat\n"
-                 << R"(generator-settings={"biome":"minecraft:plains","layers":[{"block":"minecraft:bedrock","height":1},{"block":"minecraft:dirt","height":2},{"block":"minecraft:grass_block","height":1}]})"
-                 << '\n';
-      if (valkeyTerrain)
-        settings << (normal ? "level-seed=3955\n" : "level-seed=0\n");
-    }
     fs::current_path(instance);
 
     std::vector<JavaVMOption> options;
@@ -349,6 +337,17 @@ public:
     return CopyPacket(data);
   }
 
+  std::optional<std::vector<std::byte>> NextPlayTerrainPacket(jlong entityId)
+  {
+    auto bridge = PlayerBridge();
+    auto next = env->GetStaticMethodID(bridge, "nextPlayTerrainPacket", "(J)[B");
+    auto data = static_cast<jbyteArray>(env->CallStaticObjectMethod(bridge, next, entityId));
+    auto packet = CopyPacket(data);
+    if (data)
+      env->DeleteLocalRef(data);
+    return packet;
+  }
+
   std::optional<std::vector<std::byte>> NextTerrainSnapshot()
   {
     auto bridge = PlayerBridge();
@@ -359,46 +358,52 @@ public:
     return CopyPacket(data);
   }
 
-  struct TerrainBreak
+  std::vector<std::uint8_t> NextTerrainUse()
   {
-    jlong entity;
-    jint x, y, z, sequence;
-  };
+    const auto bridge = PlayerBridge();
+    const auto method = env->GetStaticMethodID(bridge, "nextRemoteTerrainUse", "()[B");
+    CheckJava();
+    return CopyBytes(static_cast<jbyteArray>(env->CallStaticObjectMethod(bridge, method)));
+  }
 
-  std::optional<TerrainBreak> NextTerrainBreak()
+  std::vector<std::uint8_t> NextCollisionChanges()
   {
-    auto bridge = PlayerBridge();
-    auto method = env->GetStaticMethodID(bridge, "nextRemoteBreak", "()[J");
+    const auto bridge = PlayerBridge();
+    const auto method = env->GetStaticMethodID(bridge, "nextCollisionChanges", "()[B");
     CheckJava();
-    auto data = static_cast<jlongArray>(env->CallStaticObjectMethod(bridge, method));
+    return CopyBytes(static_cast<jbyteArray>(env->CallStaticObjectMethod(bridge, method)));
+  }
+
+  void ApplyCollisionChanges(std::span<const std::uint8_t> changes)
+  {
+    const auto bridge = PlayerBridge();
+    const auto method = env->GetStaticMethodID(bridge, "applyCollisionChanges", "([B)V");
     CheckJava();
-    if (!data)
-      return std::nullopt;
-    std::array<jlong, 5> values;
-    env->GetLongArrayRegion(data, 0, values.size(), values.data());
+    const auto data = JavaBytes(changes);
+    env->CallStaticVoidMethod(bridge, method, data);
     env->DeleteLocalRef(data);
     CheckJava();
-    return TerrainBreak{values[0], static_cast<jint>(values[1]), static_cast<jint>(values[2]),
-                        static_cast<jint>(values[3]), static_cast<jint>(values[4])};
   }
 
-  jint BreakTerrainBlock(jint x, jint y, jint z)
+  std::vector<std::uint8_t> ApplyTerrainUse(jlong target, std::span<const std::uint8_t> request)
   {
-    auto bridge = PlayerBridge();
-    auto method = env->GetStaticMethodID(bridge, "breakTerrainBlock", "(III)I");
+    const auto bridge = PlayerBridge();
+    const auto method = env->GetStaticMethodID(bridge, "applyRemoteTerrainUse", "(J[B)[B");
     CheckJava();
-    const auto result = env->CallStaticIntMethod(bridge, method, x, y, z);
-    CheckJava();
-    return result;
+    const auto data = JavaBytes(request);
+    const auto result = static_cast<jbyteArray>(env->CallStaticObjectMethod(bridge, method, target, data));
+    env->DeleteLocalRef(data);
+    return CopyBytes(result);
   }
 
-  void CompleteTerrainBreak(const TerrainBreak& action, jint state)
+  void CompleteTerrainUse(jlong entity, std::span<const std::uint8_t> result)
   {
-    auto bridge = PlayerBridge();
-    auto method = env->GetStaticMethodID(bridge, "completeRemoteBreak", "(JIIIII)V");
+    const auto bridge = PlayerBridge();
+    const auto method = env->GetStaticMethodID(bridge, "completeRemoteTerrainUse", "(J[B)V");
     CheckJava();
-    env->CallStaticVoidMethod(bridge, method, action.entity, action.x, action.y, action.z,
-                              action.sequence, state);
+    const auto data = JavaBytes(result);
+    env->CallStaticVoidMethod(bridge, method, entity, data);
+    env->DeleteLocalRef(data);
     CheckJava();
   }
 
@@ -412,7 +417,7 @@ public:
     return range;
   }
 
-  std::optional<std::array<double, 7>> TakePose(jlong entityId)
+  std::optional<std::array<double, 15>> TakePose(jlong entityId)
   {
     auto bridge = PlayerBridge();
     auto method = env->GetStaticMethodID(bridge, "takePose", "(J)[D");
@@ -421,23 +426,24 @@ public:
     CheckJava();
     if (!data)
       return std::nullopt;
-    std::array<double, 7> pose;
+    std::array<double, 15> pose;
     env->GetDoubleArrayRegion(data, 0, pose.size(), pose.data());
     env->DeleteLocalRef(data);
     CheckJava();
     return pose;
   }
 
-  void ReceivePacket(jlong entityId, std::span<const uint8_t> bytes, jint command)
+  void ReceivePacket(jlong entityId, std::span<const uint8_t> bytes, jint command,
+                     jboolean previousEpoch = JNI_FALSE)
   {
     auto bridge = PlayerBridge();
-    auto receive = env->GetStaticMethodID(bridge, "receivePacket", "(J[BI)V");
+    auto receive = env->GetStaticMethodID(bridge, "receivePacket", "(J[BIZ)V");
     CheckJava();
     auto data = env->NewByteArray(static_cast<jsize>(bytes.size()));
     CheckJava();
     env->SetByteArrayRegion(data, 0, static_cast<jsize>(bytes.size()),
                             reinterpret_cast<const jbyte*>(bytes.data()));
-    env->CallStaticVoidMethod(bridge, receive, entityId, data, command);
+    env->CallStaticVoidMethod(bridge, receive, entityId, data, command, previousEpoch);
     env->DeleteLocalRef(data);
     CheckJava();
   }

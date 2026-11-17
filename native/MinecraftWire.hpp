@@ -9,6 +9,7 @@ namespace MinecraftWire
 {
 inline constexpr std::uint32_t WorldActorShow = 0x4d43010e;
 inline constexpr std::uint32_t WorldActorUpdate = 0x4d43010f;
+inline constexpr std::uint32_t PlayTerrain = 0x4d430110;
 
 template <typename Integer>
 void AppendBigEndian(std::vector<std::uint8_t>& bytes, Integer value)

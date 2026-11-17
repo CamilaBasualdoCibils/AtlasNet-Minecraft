@@ -7,6 +7,7 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 import net.minecraft.client.multiplayer.ServerData;
 import java.util.concurrent.CompletableFuture;
+import org.slf4j.LoggerFactory;
 
 public final class AtlasNetConnectScreen extends Screen {
     private final Screen parent;
@@ -36,7 +37,7 @@ public final class AtlasNetConnectScreen extends Screen {
     private void connect() {
         long handle = 0;
         try {
-            handle = AtlasNetConnection.open(endpoint);
+            handle = openIngress();
             if (cancelled) {
                 return;
             }
@@ -59,6 +60,7 @@ public final class AtlasNetConnectScreen extends Screen {
                 status = Component.literal("Disconnected from AtlasNet");
             }
         } catch (IOException | LinkageError error) {
+            LoggerFactory.getLogger(AtlasNetConnectScreen.class).warn("AtlasNet connection failed", error);
             status = Component.literal("AtlasNet connection failed. " + error.getMessage());
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
@@ -66,6 +68,18 @@ public final class AtlasNetConnectScreen extends Screen {
             if (handle != 0) {
                 AtlasNetConnection.close(handle);
             }
+        }
+    }
+
+    private long openIngress() throws IOException {
+        try {
+            return AtlasNetConnection.open(endpoint);
+        } catch (IOException error) {
+            if (cancelled || !"Timed out waiting for Client V1 HandshakeResponse".equals(error.getMessage())) {
+                throw error;
+            }
+            status = Component.literal("Retrying AtlasNet connection…");
+            return AtlasNetConnection.open(endpoint);
         }
     }
 

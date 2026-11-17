@@ -29,12 +29,13 @@ abstract class RegionOutlineMixin {
             atlasnet$shape = shape;
             atlasnet$edges = AtlasNetRegionOutline.edges(shape);
         }
-        if (atlasnet$edges.isEmpty()) {
+        if (connection == null || !connection.showsRegion()) {
             return;
         }
 
         var vertex = buffers.getBuffer(RenderType.lines());
         var transform = pose.last();
+        AtlasNetRegionOutline.drawChunkGrid(vertex, transform, x, y, z);
         for (int i = 0; i < atlasnet$edges.size(); i++) {
             atlasnet$edges.get(i).draw(vertex, transform, x, z);
         }

@@ -4,6 +4,7 @@ import net.atlasnet.minecraft.atlasnet.protocol.commands.ChatCommand;
 import net.atlasnet.minecraft.atlasnet.protocol.signals.ChatSignal;
 import net.atlasnet.minecraft.atlasnet.protocol.signals.PlayerJoinedSignal;
 import net.atlasnet.minecraft.atlasnet.protocol.signals.PlayerLeftSignal;
+import net.atlasnet.minecraft.atlasnet.protocol.signals.PlayerPoseSignal;
 import net.atlasnet.minecraft.atlasnet.protocol.signals.PlayerRegionSignal;
 import net.atlasnet.minecraft.atlasnet.protocol.signals.PlayerRegionSignal.Plane;
 import net.atlasnet.minecraft.atlasnet.protocol.signals.PlayerRegionSignal.Point;
@@ -15,6 +16,7 @@ import net.atlasnet.minecraft.atlasnet.protocol.signals.WorldActorSignal;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
@@ -51,6 +53,26 @@ public final class ProtocolRegistryTest {
         terrainUpdate();
         terrainSnapshot();
         worldActor();
+        playerPose();
+    }
+
+    private static void playerPose() throws IOException {
+        var frame = ByteBuffer.allocate(93)
+                .putLong(7).putLong(8).putLong(9)
+                .putDouble(120.75).putDouble(180).putDouble(-35.25)
+                .putFloat(130).putFloat(-12).putFloat(125)
+                .put((byte) (8 | 16 | 32))
+                .putInt(40).putInt(20).putInt(300).putInt(301)
+                .putInt(302).putInt(303).putInt(304).putInt(305).array();
+        var pose = PlayerPoseSignal.decode(frame);
+        if (pose.entity() != 7 || pose.revision() != 9 || pose.x() != 120.75 || pose.headYaw() != 125
+                || !pose.flying() || !pose.usingItem() || !pose.usingOffhand() || pose.onGround()
+                || pose.mainSwing() != 40 || pose.offSwing() != 20 || pose.mainItem() != 300 || pose.offItem() != 301
+                || pose.headItem() != 302 || pose.chestItem() != 303 || pose.legsItem() != 304
+                || pose.feetItem() != 305) {
+            throw new AssertionError("Player pose and action fields must match the native wire layout");
+        }
+        expectBadPayload(() -> PlayerPoseSignal.decode(Arrays.copyOf(frame, frame.length - 1)));
     }
 
     private static void worldActor() {
@@ -63,6 +85,23 @@ public final class ProtocolRegistryTest {
                 || pose.yaw() != 30 || pose.pitch() != -12 || pose.kind() != WorldActorSignal.ARROW) {
             throw new AssertionError("World actor pose differs from the shard frame layout");
         }
+        var type = "minecraft:snowball";
+        var typeBytes = type.getBytes(StandardCharsets.UTF_8);
+        var item = new byte[] {1, 2, 3};
+        int kindOffset = frame.capacity() - 1;
+        var projectile = ByteBuffer.allocate(frame.capacity() + 1 + typeBytes.length + item.length)
+                .put(frame.array()).put((byte) typeBytes.length).put(typeBytes).put(item);
+        projectile.put(kindOffset, WorldActorSignal.PROJECTILE);
+        var decoded = WorldActorSignal.decode(projectile.array());
+        if (!type.equals(decoded.projectileType()) || !Arrays.equals(item, decoded.item())) {
+            throw new AssertionError("Projectile type and item data differ from the shard frame layout");
+        }
+        projectile.put(kindOffset + 1, (byte) WorldActorSignal.MAX_TYPE_BYTES);
+        try {
+            WorldActorSignal.decode(projectile.array());
+            throw new AssertionError("Expected a truncated projectile type to be rejected");
+        } catch (IllegalArgumentException expected) {
+        }
         frame.put(frame.capacity() - 1, WorldActorSignal.ITEM);
         try {
             WorldActorSignal.decode(frame.array());
@@ -74,16 +113,17 @@ public final class ProtocolRegistryTest {
 
     private static void terrainSnapshot() {
         long viewer = Long.MIN_VALUE + 10;
-        var frame = ByteBuffer.allocate(35)
-                .putLong(viewer).putLong(3).putInt(-16).putInt(2).putInt(4096).putInt(4099)
+        var frame = ByteBuffer.allocate(51)
+                .putLong(viewer).putLong(19).putLong(41).putLong(3).putInt(-16).putInt(2).putInt(4096).putInt(4099)
                 .put(new byte[] {1, 2, 3});
         var part = TerrainSnapshotSignal.decode(frame.array());
-        if (part.viewer() != viewer || part.sequence() != 3 || part.x() != -16 || part.z() != 2
+        if (part.viewer() != viewer || part.sourceHigh() != 19 || part.sourceLow() != 41
+                || part.sequence() != 3 || part.x() != -16 || part.z() != 2
                 || part.offset() != 4096 || part.size() != 4099
                 || !Arrays.equals(part.bytes(), new byte[] {1, 2, 3})) {
             throw new AssertionError("Authoritative terrain fragment does not match the shard wire layout");
         }
-        frame.putInt(24, Integer.MAX_VALUE);
+        frame.putInt(40, Integer.MAX_VALUE);
         try {
             TerrainSnapshotSignal.decode(frame.array());
         } catch (IllegalArgumentException expected) {

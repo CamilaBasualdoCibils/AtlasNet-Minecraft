@@ -40,6 +40,7 @@ target_include_directories(AtlasNetMinecraftShard PRIVATE
     "${_minecraft_java_home}/include" "${_minecraft_java_home}/include/linux")
 target_link_libraries(AtlasNetMinecraftShard PRIVATE "${_minecraft_java_home}/lib/server/libjvm.so")
 target_compile_definitions(AtlasNetMinecraftShard PRIVATE
+    MINECRAFT_SHARD_PROPERTIES_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../server.properties"
     MINECRAFT_SHARD_LAUNCH_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../fabric/build/atlasnet/shard-launch.txt")
 
 if(TARGET AtlasNetSteamNetSock OR SDK_ATLASNET_STEAMNETSOCK)

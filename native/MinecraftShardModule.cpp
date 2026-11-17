@@ -1,5 +1,6 @@
 #include "AtlasNet/Module/ModuleAPI.hpp"
 #include "FabricServerHost.hpp"
+#include "MinecraftEntityCosts.hpp"
 #include "MinecraftActorReplication.hpp"
 #include "MinecraftChunkDemand.hpp"
 #include "MinecraftWire.hpp"
@@ -24,13 +25,16 @@ using MinecraftWire::ReadBigEndian;
 constexpr AtlasNet::CmdSig::SignalID TerrainUpdateSignal = 0x4d430109;
 constexpr AtlasNet::CmdSig::SignalID TerrainViewerSignal = 0x4d43010a;
 constexpr AtlasNet::CmdSig::SignalID TerrainSnapshotSignal = 0x4d43010b;
+constexpr AtlasNet::CmdSig::CommandID PlayerInputCommand = 0x4d430004;
+constexpr AtlasNet::CmdSig::CommandID BlockInteractionCommand = 0x4d430005;
 constexpr AtlasNet::CmdSig::CommandID GameplayInputCommand = 0x4d430006;
 constexpr AtlasNet::CmdSig::CommandID PlayerAttackCommand = 0x4d430007;
 constexpr std::size_t MaxGameplayInputBytes = 16 * 1024;
 constexpr std::size_t TerrainUpdateHeaderBytes = 3 * sizeof(std::int32_t);
 constexpr std::size_t SnapshotQueueHeaderBytes = sizeof(std::uint64_t) + 3 * sizeof(std::int32_t);
-constexpr std::size_t SnapshotWireHeaderBytes = 2 * sizeof(std::uint64_t) + 4 * sizeof(std::int32_t);
-constexpr std::size_t PoseBytes = 6 * sizeof(std::uint64_t) + 3 * sizeof(std::uint32_t) + 1;
+constexpr std::size_t SnapshotWireHeaderBytes = 4 * sizeof(std::uint64_t) + 4 * sizeof(std::int32_t);
+constexpr std::size_t PoseBytes = 6 * sizeof(std::uint64_t) + 11 * sizeof(std::uint32_t) + 1;
+constexpr AtlasNet::CmdSig::SignalID PlayerPoseShow = 0x4d430107;
 constexpr std::size_t TransferHeaderBytes = 4 * sizeof(std::uint64_t) + 16 + 5 * sizeof(std::uint32_t);
 constexpr std::size_t MaxPlayerTransferBytes = 48 * 1024;
 constexpr std::size_t PlayFrameHeaderBytes = 1 + sizeof(std::uint64_t);
@@ -39,10 +43,11 @@ using PoseSnapshot = AtlasNet::Network::RPC::RPCMethod<
     "Minecraft.PlayerPose", std::vector<std::uint8_t>>;
 using TerrainPlayerPoses = AtlasNet::Network::RPC::RPCMethod<
     "Minecraft.TerrainPlayerPoses", std::vector<std::uint8_t>, double, double, double, double>;
-using BreakTerrainBlock = AtlasNet::Network::RPC::RPCMethod<
-    "Minecraft.BreakTerrainBlock", int, int, int, int>;
-using ReconcilePlayerVisibility = AtlasNet::Network::RPC::RPCMethod<
-    "Minecraft.ReconcilePlayerVisibility", bool, std::vector<std::uint8_t>>;
+using UseTerrainBlock = AtlasNet::Network::RPC::RPCMethod<
+    "Minecraft.UseTerrainBlock", std::vector<std::uint8_t>,
+    std::uint64_t, int, int, std::vector<std::uint8_t>>;
+using TerrainCollisionChanges = AtlasNet::Network::RPC::RPCMethod<
+    "Minecraft.TerrainCollisionChanges", void, std::vector<std::uint8_t>>;
 using TerrainVacated = AtlasNet::Network::RPC::RPCMethod<"Minecraft.TerrainVacated", bool, int, int>;
 using PlayerMelee = AtlasNet::Network::RPC::RPCMethod<
     "Minecraft.PlayerMelee", std::vector<std::uint8_t>, std::vector<std::uint8_t>>;
@@ -67,6 +72,7 @@ public:
     partitionedTerrain = storage && std::string_view(storage) == "partitioned";
     valkeyTerrain = partitionedTerrain || (storage && std::string_view(storage) == "1");
     liveTerrain = partitionedTerrain && std::getenv("MINECRAFT_TERRAIN_SESSION");
+    shardIdentity = shard;
     shardName = shard.to_string();
     AtlasNet::EntityMigrationCallbacks callbacks;
     callbacks.prepareExtract = [this](auto entity, auto transfer, auto& payload) {
@@ -147,12 +153,10 @@ public:
       }
       if (!server.ActivatePlayer(entity.value()))
         return false;
-      for (auto& [id, observer] : players)
-        if (observer.visible.erase(entity))
-          HidePlayer(observer.client, entity);
       auto& player = players.emplace(entity, std::move(incoming->second)).first->second;
       stagedPlayers.erase(incoming);
       CapturePose(entity, player);
+      ObservePlayers(entity, player);
       return true;
     };
     callbacks.abortExtract = [this](auto entity, auto transfer) {
@@ -205,28 +209,6 @@ public:
         return std::vector<std::uint8_t>{};
       return server.ApplyMelee(context.localEntities.front().value(), state);
     });
-    BindSpatialRPC<ReconcilePlayerVisibility>([this](const AtlasNet::SpatialRPCContext& context,
-                                                     const std::vector<std::uint8_t>& pose) {
-      if (context.world != Overworld || pose.size() != PoseBytes)
-        return false;
-      const AtlasNet::AtlasNetEntityID subject{
-          ReadBigEndian<std::uint64_t>(std::as_bytes(std::span(pose)))};
-      if (players.contains(subject))
-        return true;
-      for (auto& [id, observer] : players)
-      {
-        if (!observer.ready || observer.awaitingAuthority || IsEntityMigrationPending(id) ||
-            observer.interest == AtlasNet::SpatialInterestHandle{} || observer.visible.contains(subject))
-          continue;
-        const auto members = GetSpatialInterestEntities(observer.interest);
-        if (std::ranges::find(members, subject) != members.end())
-        {
-          observer.visible.emplace(subject, ++visibilityGeneration);
-          SendVisibility(observer.client, 0x4d430107, pose);
-        }
-      }
-      return true;
-    });
     if (valkeyTerrain)
       MinecraftTerrain::Bind(*this, server);
     else
@@ -247,27 +229,38 @@ public:
               dx * dx + dy * dy + dz * dz <= radius * radius)
           {
             AppendBigEndian(result, static_cast<std::uint32_t>(PoseBytes));
+            AppendBigEndian(result, PlayerPoseShow);
             result.insert(result.end(), player.pose.begin(), player.pose.end());
           }
         }
         worldActors.AppendNearby(result, x, y, z, radius);
         return result;
       });
-      BindSpatialRPC<BreakTerrainBlock>([this](const AtlasNet::SpatialRPCContext& context,
-                                              int x, int y, int z) {
+      BindSpatialRPC<UseTerrainBlock>([this](const AtlasNet::SpatialRPCContext& context,
+          std::uint64_t target, int x, int z, const std::vector<std::uint8_t>& request) {
         if (!server.Started() || context.world != Overworld ||
             !context.IsAuthoritative(MinecraftTerrain::ChunkCenter(ChunkCoordinate(x), ChunkCoordinate(z))))
-          return -1;
-        return server.BreakTerrainBlock(x, y, z);
+          return std::vector<std::uint8_t>{};
+        return server.ApplyTerrainUse(std::bit_cast<std::int64_t>(target), request);
       });
     }
     if (liveTerrain)
+    {
       BindSpatialRPC<TerrainVacated>([this](const AtlasNet::SpatialRPCContext& context, int x, int z) {
         if (!server.Started() || !context.IsAuthoritative(MinecraftTerrain::ChunkCenter(x, z)))
           return false;
         server.TerrainVacated(x, z, false);
         return true;
       });
+      BindSpatialRPC<TerrainCollisionChanges>([this](const AtlasNet::SpatialRPCContext& context,
+          const std::vector<std::uint8_t>& changes) {
+        if (!server.Started() || context.world != Overworld || changes.size() <= 24)
+          return;
+        const auto [x, z] = ReadCollisionChunk(changes);
+        if (!context.IsAuthoritative(MinecraftTerrain::ChunkCenter(x, z)))
+          server.ApplyCollisionChanges(changes);
+      });
+    }
   }
 
   std::optional<AtlasNet::AtlasNetEntityID> OnClientSpawn(
@@ -338,6 +331,8 @@ public:
       const auto entity = command.entity.value();
       if (payload.commandID == 0x4d430002 && payload.payload.empty() && !player->second.ready)
       {
+        // Ingress registers the assigned ID after OnClientSpawn returns.
+        UpdateEntityCost(command.entity, MinecraftEntityCosts::Player);
         player->second.ready = true;
         if (partitionedTerrain)
         {
@@ -349,18 +344,25 @@ public:
         SendRegion(player->second.client, player->second.playEpoch);
         SendShardMetrics(player->second.client, player->second.playEpoch);
         PublishPose(command.entity, player->second);
-        if (!valkeyTerrain || partitionedTerrain)
-          ObservePlayers(command.entity, player->second);
+        ObservePlayers(command.entity, player->second);
       }
       else if (player->second.ready && payload.payload.size() >= sizeof(std::uint64_t) &&
                payload.payload.size() <= sizeof(std::uint64_t) +
                    (payload.commandID == GameplayInputCommand ? MaxGameplayInputBytes : 64) &&
-               (payload.commandID == 0x4d430003 || payload.commandID == 0x4d430004 ||
-                payload.commandID == GameplayInputCommand || (valkeyTerrain && payload.commandID == 0x4d430005)))
+               (payload.commandID == 0x4d430003 || payload.commandID == PlayerInputCommand ||
+                payload.commandID == GameplayInputCommand || (valkeyTerrain && payload.commandID == BlockInteractionCommand)))
       {
         auto data = std::span(payload.payload);
-        if (ReadBigEndian<std::uint64_t>(std::as_bytes(data)) != player->second.playEpoch)
+        const auto epoch = ReadBigEndian<std::uint64_t>(std::as_bytes(data));
+        if (epoch != player->second.playEpoch)
+        {
+          // Position, posture and global block references survive the play
+          // listener change. Worker-local entity and container IDs do not.
+          if ((payload.commandID == PlayerInputCommand || payload.commandID == BlockInteractionCommand) &&
+              player->second.playEpoch > 0 && epoch == player->second.playEpoch - 1)
+            server.ReceivePacket(entity, data.subspan(sizeof(epoch)), payload.commandID, JNI_TRUE);
           continue;
+        }
         player->second.hasPlayInput = true;
         if (std::exchange(player->second.awaitingAuthority, false))
         {
@@ -368,18 +370,6 @@ public:
           // committed AtlasNet authority route.
           SendRegion(player->second.client, player->second.playEpoch);
           SendShardMetrics(player->second.client, player->second.playEpoch);
-          if (player->second.interest != AtlasNet::SpatialInterestHandle{})
-          {
-            ReconcileTransferredView(player->second);
-            ObservePlayers(command.entity, player->second);
-          }
-          // AtlasNet preserves interest membership through migration. Refresh
-          // observers on the old shard whose vanilla tracker has removed us.
-          const auto& [x, y, z] = player->second.position;
-          const double radius = player->second.trackingRange + (region ? region->hysteresisDistance : 0);
-          if (player->second.pose.size() == PoseBytes)
-            CallSpatial<ReconcilePlayerVisibility>({.world = Overworld, .shape =
-                AtlasNet::Spatial::Sphere{.center = {x, y, z}, .radius = radius}}, {player->second.pose});
         }
         server.ReceivePacket(entity, data.subspan(sizeof(std::uint64_t)), payload.commandID);
       }
@@ -448,8 +438,8 @@ public:
     if (std::exchange(seedMarkers, false))
     {
       seeded = true;
-      markers.insert(RegisterEntity({.x = -16, .y = -60}));
-      markers.insert(RegisterEntity({.x = 16, .y = -60}));
+      markers.insert(RegisterEntity({.x = -16, .y = -60}, MinecraftEntityCosts::Other));
+      markers.insert(RegisterEntity({.x = 16, .y = -60}, MinecraftEntityCosts::Other));
     }
     FinishSnapshots();
     const bool newRegion = std::exchange(regionChanged, false);
@@ -468,40 +458,14 @@ public:
         if (newRegion)
           SendRegion(player.client, player.playEpoch);
       }
-      for (int index = 0; index < 4; ++index)
-      {
-        if (player.packet.empty())
-        {
-          auto packet = server.NextPacket(entity.value());
-          if (!packet)
-            break;
-          if (packet->front() == std::byte{1})
-          {
-            SendTerrainUpdate(player, std::span<const std::byte>(*packet).subspan(1));
-            continue;
-          }
-          player.packet = std::move(*packet);
-          player.offset = 1;
-        }
-        const auto count = std::min(AtlasNet::Module::MaxSignalPayloadBytes - PlayFrameHeaderBytes,
-                                    player.packet.size() - player.offset);
-        const bool last = player.offset + count == player.packet.size();
-        std::vector<std::byte> payload{last ? std::byte{1} : std::byte{0}};
-        for (std::size_t i = sizeof(player.playEpoch); i > 0; --i)
-          payload.push_back(static_cast<std::byte>(player.playEpoch >> ((i - 1) * 8)));
-        payload.insert(payload.end(), player.packet.begin() + player.offset,
-                       player.packet.begin() + player.offset + count);
-        AtlasNet::Module::ClientSignal signal{
-            .recipient = player.client, .signal = 0x4d430105, .payload = std::move(payload)};
-        DispatchRawSignals(std::span(&signal, 1));
-        player.offset += count;
-        if (last)
-          player.packet.clear();
-      }
+      SendPlayPackets(entity, player, player.packet, player.offset, false);
+      SendPlayPackets(entity, player, player.terrainPacket, player.terrainOffset, true);
     }
     if (partitionedTerrain)
     {
-      ProcessTerrainBreaks();
+      ProcessTerrainUses();
+      if (liveTerrain)
+        SendCollisionChanges();
       SendTerrainSnapshots();
     }
   }
@@ -536,35 +500,72 @@ private:
     return block / 16 - (remainder < 0 ? 1 : 0);
   }
 
-  void ProcessTerrainBreaks()
+  static std::pair<int, int> ReadCollisionChunk(std::span<const std::uint8_t> frame)
   {
-    std::erase_if(terrainBreaks, [this](auto& call) {
-      if (call.result.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
-        return false;
-      const auto result = call.result.get();
-      const int state = result.failures.empty() && result.responses.size() == 1
-          ? result.responses.front().value : -1;
-      server.CompleteTerrainBreak(call.action, state);
-      return true;
-    });
-    for (int i = 0; i < 8; ++i)
+    const auto bytes = std::as_bytes(frame);
+    return {std::bit_cast<std::int32_t>(ReadBigEndian<std::uint32_t>(bytes)),
+            std::bit_cast<std::int32_t>(ReadBigEndian<std::uint32_t>(bytes.subspan(4)))};
+  }
+
+  void SendCollisionChanges()
+  {
+    for (int i = 0; i < 32; ++i)
     {
-      const auto action = server.NextTerrainBreak();
-      if (!action)
+      auto changes = server.NextCollisionChanges();
+      if (changes.size() <= 24)
         break;
-      AtlasNet::Spatial::Query target{.world = Overworld, .shape = AtlasNet::Spatial::Point{
-          MinecraftTerrain::ChunkCenter(ChunkCoordinate(action->x), ChunkCoordinate(action->z))}};
-      terrainBreaks.push_back({*action, CallSpatial<BreakTerrainBlock>(target,
-          {action->x, action->y, action->z})});
+      const auto [x, z] = ReadCollisionChunk(changes);
+      CallSpatial<TerrainCollisionChanges>(TerrainAudience(x, z, MinecraftTerrain::MaxDistance),
+                                          {std::move(changes)});
     }
   }
 
-  struct PendingTerrainBreak
+  void ProcessTerrainUses()
   {
-    FabricServerHost::TerrainBreak action;
-    std::future<AtlasNet::SpatialRPCResult<int>> result;
+    std::erase_if(terrainUses, [this](auto& call) {
+      if (call.result.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return false;
+      const auto result = call.result.get();
+      std::span<const std::uint8_t> state;
+      for (const auto& response : result.responses)
+      {
+        if (response.value.empty())
+          continue;
+        if (!state.empty())
+        {
+          std::clog << "Multiple Minecraft chunk owners responded to one terrain interaction" << std::endl;
+          state = {};
+          break;
+        }
+        state = response.value;
+      }
+      server.CompleteTerrainUse(call.entity, state);
+      return true;
+    });
+    constexpr auto HeaderBytes = 2 * sizeof(std::uint64_t) + 2 * sizeof(std::uint32_t);
+    for (int i = 0; i < 8; ++i)
+    {
+      const auto frame = server.NextTerrainUse();
+      if (frame.size() <= HeaderBytes)
+        break;
+      const auto bytes = std::as_bytes(std::span(frame));
+      const auto entity = std::bit_cast<std::int64_t>(ReadBigEndian<std::uint64_t>(bytes));
+      const auto block = ReadBigEndian<std::uint64_t>(bytes.subspan(8));
+      const auto x = std::bit_cast<std::int32_t>(ReadBigEndian<std::uint32_t>(bytes.subspan(16)));
+      const auto z = std::bit_cast<std::int32_t>(ReadBigEndian<std::uint32_t>(bytes.subspan(20)));
+      const AtlasNet::Spatial::Query target{.world = Overworld, .shape = AtlasNet::Spatial::Point{
+          MinecraftTerrain::ChunkCenter(ChunkCoordinate(x), ChunkCoordinate(z))}};
+      terrainUses.push_back({entity, CallSpatial<UseTerrainBlock>(target,
+          {block, x, z, {frame.begin() + HeaderBytes, frame.end()}})});
+    }
+  }
+
+  struct PendingTerrainUse
+  {
+    std::int64_t entity;
+    std::future<AtlasNet::SpatialRPCResult<std::vector<std::uint8_t>>> result;
   };
-  std::vector<PendingTerrainBreak> terrainBreaks;
+  std::vector<PendingTerrainUse> terrainUses;
 
   void StartMinecraft()
   {
@@ -623,7 +624,7 @@ private:
       {
         const bool first = chunks.empty();
         const auto [worldX, worldY, worldZ] = MinecraftTerrain::ChunkCenter(x, z);
-        const auto entity = RegisterEntity({.x = worldX, .y = worldY, .z = worldZ});
+        const auto entity = RegisterEntity({.x = worldX, .y = worldY, .z = worldZ}, MinecraftEntityCosts::Chunk);
         chunks.emplace(key, entity);
         chunkKeys.emplace(entity, key);
         ++registeredChunks;
@@ -681,6 +682,7 @@ private:
   std::optional<AtlasNet::Module::RegionShape> terrainRegion;
   std::vector<MinecraftTerrain::PendingUpdate> pendingDemand;
   std::string shardName;
+  AtlasNet::ShardID shardIdentity{};
   std::unordered_map<std::uint64_t, AtlasNet::AtlasNetEntityID> chunks;
   std::unordered_map<AtlasNet::AtlasNetEntityID, std::uint64_t> chunkKeys;
   std::unordered_map<AtlasNet::AtlasNetEntityID, std::uint64_t> incomingChunks;
@@ -699,6 +701,8 @@ private:
     double trackingRange = 0;
     std::vector<std::byte> packet;
     std::size_t offset = 0;
+    std::vector<std::byte> terrainPacket;
+    std::size_t terrainOffset = 0;
     AtlasNet::SpatialInterestHandle interest{};
     std::unordered_map<AtlasNet::AtlasNetEntityID, std::uint64_t> visible;
     std::vector<std::uint8_t> pose;
@@ -781,16 +785,42 @@ private:
     return true;
   }
 
-  void ReconcileTransferredView(Player& player)
+  void SendPlayPackets(AtlasNet::AtlasNetEntityID entity, Player& player, std::vector<std::byte>& packet,
+                       std::size_t& offset, bool terrain)
   {
-    const auto current = GetSpatialInterestEntities(player.interest);
-    const std::unordered_set<AtlasNet::AtlasNetEntityID> members(current.begin(), current.end());
-    std::erase_if(player.visible, [this, &player, &members](const auto& entry) {
-      if (!players.contains(entry.first) && members.contains(entry.first))
-        return false;
-      HidePlayer(player.client, entry.first);
-      return true;
-    });
+    for (int index = 0; index < 4; ++index)
+    {
+      if (packet.empty())
+      {
+        auto next = terrain ? server.NextPlayTerrainPacket(entity.value()) : server.NextPacket(entity.value());
+        if (!next)
+          break;
+        if (next->front() == std::byte{1})
+        {
+          SendTerrainUpdate(player, std::span<const std::byte>(*next).subspan(1));
+          continue;
+        }
+        packet = std::move(*next);
+        offset = 1;
+      }
+      const auto count = std::min(AtlasNet::Module::MaxSignalPayloadBytes - PlayFrameHeaderBytes,
+                                  packet.size() - offset);
+      const bool last = offset + count == packet.size();
+      std::vector<std::byte> payload{last ? std::byte{1} : std::byte{0}};
+      for (std::size_t i = sizeof(player.playEpoch); i > 0; --i)
+        payload.push_back(static_cast<std::byte>(player.playEpoch >> ((i - 1) * 8)));
+      payload.insert(payload.end(), packet.begin() + offset, packet.begin() + offset + count);
+      AtlasNet::Module::ClientSignal signal{
+          .recipient = player.client, .signal = terrain ? MinecraftWire::PlayTerrain : 0x4d430105,
+          .payload = std::move(payload), .options = {
+              .batching = terrain ? AtlasNet::Module::GameplayBatching::Batched
+                                  : AtlasNet::Module::GameplayBatching::Immediate,
+              .stream = terrain ? 1u : 0u}};
+      DispatchRawSignals(std::span(&signal, 1));
+      offset += count;
+      if (last)
+        packet.clear();
+    }
   }
 
   void SendTerrainUpdate(const Player& player, std::span<const std::byte> payload)
@@ -833,6 +863,8 @@ private:
       std::vector<std::uint8_t> payload;
       payload.reserve(SnapshotWireHeaderBytes + count);
       AppendBigEndian(payload, viewer);
+      const auto* origin = static_cast<const std::uint8_t*>(shardIdentity.data());
+      payload.insert(payload.end(), origin, origin + shardIdentity.size());
       AppendBigEndian(payload, snapshotSequence);
       AppendBigEndian(payload, x);
       AppendBigEndian(payload, z);
@@ -842,7 +874,7 @@ private:
       payload.insert(payload.end(), first, first + count);
       DispatchSignal(TerrainAudience(std::bit_cast<std::int32_t>(x), std::bit_cast<std::int32_t>(z),
                                      static_cast<int>(view)), TerrainSnapshotSignal,
-                     std::as_bytes(std::span(payload)));
+                     std::as_bytes(std::span(payload)), {.stream = 2});
       snapshotOffset += count;
       if (snapshotOffset == packet.size())
         snapshot.clear();
@@ -892,7 +924,8 @@ private:
     auto pose = server.TakePose(entity.value());
     if (!pose)
       return;
-    const auto& [x, y, z, yaw, pitch, head, flags] = *pose;
+    const auto& [x, y, z, yaw, pitch, head, flags, mainSwing, offSwing, mainItem, offItem,
+                 headItem, chestItem, legsItem, feetItem] = *pose;
     player.position = std::array{x, y, z};
     player.poseDirty = true;
     auto& bytes = player.pose;
@@ -905,6 +938,8 @@ private:
     for (double angle : {yaw, pitch, head})
       AppendBigEndian(bytes, std::bit_cast<std::uint32_t>(static_cast<float>(angle)));
     bytes.push_back(static_cast<std::uint8_t>(flags));
+    for (double value : {mainSwing, offSwing, mainItem, offItem, headItem, chestItem, legsItem, feetItem})
+      AppendBigEndian(bytes, static_cast<std::uint32_t>(static_cast<std::int32_t>(value)));
   }
 
   void PublishPose(AtlasNet::AtlasNetEntityID entity, Player& player)
@@ -930,7 +965,7 @@ private:
           AtlasNet::Spatial::Sphere{.radius = player.trackingRange});
     OnSpatialInterest(player.interest, [this, observer](const AtlasNet::SpatialInterestEvent& event) {
       auto found = players.find(observer);
-      if (found == players.end() || players.contains(event.entity) || markers.contains(event.entity) ||
+      if (found == players.end() || event.entity == observer || markers.contains(event.entity) ||
           chunkKeys.contains(event.entity))
         return;
       auto& visible = found->second.visible;
@@ -938,6 +973,12 @@ private:
       {
         if (visible.erase(event.entity))
           HidePlayer(found->second.client, event.entity);
+        return;
+      }
+      if (auto local = players.find(event.entity); local != players.end() && local->second.pose.size() == PoseBytes)
+      {
+        if (visible.try_emplace(event.entity, ++visibilityGeneration).second)
+          SendVisibility(found->second.client, 0x4d430107, local->second.pose);
         return;
       }
       if (partitionedTerrain)
@@ -968,18 +1009,20 @@ private:
       for (const auto& response : result.responses)
       {
         auto records = std::span(response.value);
-        while (records.size() >= sizeof(std::uint32_t))
+        while (records.size() >= 2 * sizeof(std::uint32_t))
         {
           const auto size = ReadBigEndian<std::uint32_t>(std::as_bytes(records));
-          records = records.subspan(sizeof(std::uint32_t));
+          const auto signal = ReadBigEndian<std::uint32_t>(std::as_bytes(records).subspan(sizeof(size)));
+          records = records.subspan(sizeof(size) + sizeof(signal));
           if (size > records.size() || size < sizeof(std::uint64_t))
             break;
           const auto pose = records.first(size);
           records = records.subspan(size);
           const AtlasNet::AtlasNetEntityID entity{ReadBigEndian<std::uint64_t>(std::as_bytes(pose))};
-          if (members.contains(entity) && !players.contains(entity) &&
+          if ((signal == PlayerPoseShow || signal == MinecraftActorReplication::Show) &&
+              members.contains(entity) &&
               observer.visible.try_emplace(entity, 0).second)
-            SendVisibility(observer.client, size == PoseBytes ? 0x4d430107 : MinecraftActorReplication::Show, pose);
+            SendVisibility(observer.client, signal, pose);
         }
       }
     }

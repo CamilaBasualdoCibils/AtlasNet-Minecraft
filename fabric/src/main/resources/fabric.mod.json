@@ -7,6 +7,7 @@
   "environment": "*",
   "mixins": ["atlasnet_minecraft.mixins.json"],
   "entrypoints": {
+    "preLaunch": ["net.atlasnet.minecraft.fabric.server.storage.ShardWorldBootstrap"],
     "main": ["net.atlasnet.minecraft.fabric.FabricDemo"],
     "server": ["net.atlasnet.minecraft.fabric.FabricDedicatedServer"],
     "client": ["net.atlasnet.minecraft.fabric.FabricClient"]

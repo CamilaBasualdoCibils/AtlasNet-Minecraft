@@ -1,7 +1,6 @@
 package net.atlasnet.minecraft.fabric.server.storage;
 
 import java.io.IOException;
-import java.net.InetSocketAddress;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -51,15 +50,13 @@ public final class ShardChunkIO {
 
     public static void initialize() {
         if (ENABLED) {
-            boolean normal = !"flat".equals(System.getenv("MINECRAFT_TERRAIN_PRESET"));
-            var port = Integer.parseInt(System.getenv().getOrDefault("MINECRAFT_VALKEY_PORT",
-                    normal ? "46382" : "46381"));
+            var storage = ValkeyChunkStorage.local();
             try {
-                instance = new ShardChunkIO(new ValkeyChunkStorage(new InetSocketAddress("127.0.0.1", port)));
-                LOGGER.info("Using Minecraft Valkey terrain on port {}, authority epoch {}", port,
+                instance = new ShardChunkIO(storage);
+                LOGGER.info("Using Minecraft Valkey terrain on port {}, authority epoch {}", storage.port(),
                         instance.authority.epoch());
             } catch (IOException error) {
-                throw new IllegalStateException("Minecraft terrain storage is unavailable on port " + port, error);
+                throw new IllegalStateException("Minecraft terrain storage is unavailable on port " + storage.port(), error);
             }
         }
     }
@@ -76,6 +73,25 @@ public final class ShardChunkIO {
     public static boolean ownsPosition(double x, double z) {
         var io = instance;
         return io != null && io.live != null && io.live.ownsPosition(x, z);
+    }
+
+    public static boolean usesCollisionReplicas() {
+        return instance != null && instance.live != null;
+    }
+
+    public static long fencedEpoch(long chunk) {
+        var io = instance;
+        var owner = io == null || io.revoked || io.live == null ? null : io.live.authority(chunk);
+        return owner == null ? 0 : owner.epoch();
+    }
+
+    public static boolean canApplyCollisionReplica(long chunk) {
+        var io = instance;
+        return io != null && !io.revoked && io.live != null && io.live.acceptsCollisionReplica(chunk);
+    }
+
+    public static LevelChunk collisionReplica(long chunk) {
+        return instance.live.collisionReplica(chunk);
     }
 
     public static void revoke() {

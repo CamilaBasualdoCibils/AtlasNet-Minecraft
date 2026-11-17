@@ -81,10 +81,11 @@ public:
     auto& sockets = *SteamNetworkingSockets();
     sockets.RunCallbacks();
     SteamNetConnectionInfo_t info{};
-    if (!sockets.GetConnectionInfo(handle, &info) ||
-        info.m_eState == k_ESteamNetworkingConnectionState_ClosedByPeer ||
+    if (!sockets.GetConnectionInfo(handle, &info))
+      throw std::runtime_error("SteamNetSock connection is no longer available");
+    if (info.m_eState == k_ESteamNetworkingConnectionState_ClosedByPeer ||
         info.m_eState == k_ESteamNetworkingConnectionState_ProblemDetectedLocally)
-      Disconnect();
+      throw std::runtime_error(std::string("SteamNetSock disconnected: ") + info.m_szEndDebug);
     else
       connected = info.m_eState == k_ESteamNetworkingConnectionState_Connected;
   }

@@ -24,33 +24,40 @@ struct Session
   Client client{std::make_unique<Minecraft::SteamIngressTransport>()};
   std::deque<std::pair<std::uint32_t, std::vector<std::byte>>> packets;
   std::vector<std::byte> partialPacket;
+  std::vector<std::byte> partialTerrainPacket;
   std::uint64_t playEpoch = 0;
+
+  void AcceptPlayFragment(std::span<const std::byte> payload, bool terrain)
+  {
+    constexpr auto header = 1 + sizeof(std::uint64_t);
+    if (payload.size() <= header || (payload.front() != std::byte{0} && payload.front() != std::byte{1}))
+      throw std::runtime_error("Invalid AtlasNet Minecraft packet fragment");
+    const auto epoch = ReadEpoch(payload.subspan(1));
+    if (epoch < playEpoch || (terrain && epoch != playEpoch))
+      return;
+    if (epoch > playEpoch)
+    {
+      playEpoch = epoch;
+      partialPacket.clear();
+      partialTerrainPacket.clear();
+      packets.emplace_back(0x4d43010du,
+          std::vector<std::byte>(payload.begin() + 1, payload.begin() + header));
+    }
+    auto& partial = terrain ? partialTerrainPacket : partialPacket;
+    if (partial.size() + payload.size() - header > 8 * 1024 * 1024)
+      throw std::runtime_error("Invalid AtlasNet Minecraft packet fragment");
+    partial.insert(partial.end(), payload.begin() + header, payload.end());
+    if (payload.front() == std::byte{1})
+    {
+      packets.emplace_back(0x4d430105, std::move(partial));
+      partial.clear();
+    }
+  }
 
   Session()
   {
-    client.OnSignal(0x4d430105, [this](std::span<const std::byte> payload) {
-      constexpr auto header = 1 + sizeof(std::uint64_t);
-      if (payload.size() <= header || (payload.front() != std::byte{0} && payload.front() != std::byte{1}))
-        throw std::runtime_error("Invalid AtlasNet Minecraft packet fragment");
-      const auto epoch = ReadEpoch(payload.subspan(1));
-      if (epoch < playEpoch)
-        return;
-      if (epoch > playEpoch)
-      {
-        playEpoch = epoch;
-        partialPacket.clear();
-        packets.emplace_back(0x4d43010du,
-            std::vector<std::byte>(payload.begin() + 1, payload.begin() + header));
-      }
-      if (partialPacket.size() + payload.size() - header > 8 * 1024 * 1024)
-        throw std::runtime_error("Invalid AtlasNet Minecraft packet fragment");
-      partialPacket.insert(partialPacket.end(), payload.begin() + header, payload.end());
-      if (payload.front() == std::byte{1})
-      {
-        packets.emplace_back(0x4d430105, std::move(partialPacket));
-        partialPacket.clear();
-      }
-    });
+    client.OnSignal(0x4d430105, [this](std::span<const std::byte> payload) { AcceptPlayFragment(payload, false); });
+    client.OnSignal(MinecraftWire::PlayTerrain, [this](std::span<const std::byte> payload) { AcceptPlayFragment(payload, true); });
     for (auto id : {0x4d430101u, 0x4d430102u, 0x4d430103u, 0x4d430106u, 0x4d430107u,
                     0x4d430108u, 0x4d430109u, 0x4d43010au, 0x4d43010bu,
                     MinecraftWire::WorldActorShow, MinecraftWire::WorldActorUpdate})

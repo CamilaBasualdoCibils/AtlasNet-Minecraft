@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import net.atlasnet.minecraft.atlasnet.world.AtlasNetWorlds;
@@ -34,6 +35,17 @@ public final class ValkeyChunkStorageTest {
         checkTerrainAuthority();
         int port = Integer.parseInt(System.getenv().getOrDefault("MINECRAFT_VALKEY_PORT", "46381"));
         var storage = new ValkeyChunkStorage(new InetSocketAddress("127.0.0.1", port));
+        if (args.length == 1 && args[0].equals("world")) {
+            verifyWorld(storage);
+            return;
+        }
+        if (args.length == 1 && args[0].equals("legacy-world")) {
+            storage.nextAuthorityEpoch();
+            check(storage.loadOrCreateWorld("normal").equals(new ValkeyChunkStorage.World("world", 3955)),
+                    "an existing pre-metadata database keeps its original world and seed");
+            System.out.println("Verified the legacy Overworld seed and save folder");
+            return;
+        }
         if (args.length == 2 && args[0].equals("verify-region")) {
             verifyRegion(storage, Path.of(args[1]));
             return;
@@ -154,6 +166,46 @@ public final class ValkeyChunkStorageTest {
             check(expected.getMessage().contains("Unsupported chunk dimension"), "dimension error");
         }
         System.out.println("Verified NBT round trip, concurrent creation, and fenced handoff retries");
+    }
+
+    private static void verifyWorld(ValkeyChunkStorage storage) throws Exception {
+        ValkeyChunkStorage.World world;
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var first = executor.submit(() -> storage.loadOrCreateWorld("normal"));
+            var second = executor.submit(() -> storage.loadOrCreateWorld("normal"));
+            world = first.get();
+            check(world.equals(second.get()), "concurrent shards must receive the same world ID and seed");
+            check(world.levelName().startsWith("world-"), "fresh databases must receive their own save folder");
+        }
+        check(world.equals(storage.loadOrCreateWorld("normal")), "world metadata remains stable");
+        try {
+            storage.loadOrCreateWorld("flat");
+            throw new AssertionError("different generator presets must not share a world");
+        } catch (IOException expected) {
+            check(expected.getMessage().contains("terrain preset normal"), "expected a generator mismatch");
+        }
+
+        var propertiesFile = Files.createTempFile("atlasnet-world-test", ".properties");
+        var sharedProperties = Files.createTempFile("atlasnet-shared-test", ".properties");
+        try {
+            Files.writeString(propertiesFile, "level-seed=3955\nlevel-name=world\nview-distance=4\n");
+            Files.writeString(sharedProperties, "view-distance=7\n");
+            ShardWorldBootstrap.configureShard(sharedProperties, propertiesFile, "normal", world);
+            var properties = new Properties();
+            try (var input = Files.newInputStream(propertiesFile)) {
+                properties.load(input);
+            }
+            check(properties.getProperty("level-seed").equals(Long.toString(world.seed())),
+                    "Valkey replaces a stale configured seed");
+            check(properties.getProperty("level-name").equals(world.levelName()),
+                    "a new world ID bypasses existing local world files");
+            check(properties.getProperty("view-distance").equals("7"),
+                    "the shared view distance replaces the previous local setting");
+        } finally {
+            Files.deleteIfExists(propertiesFile);
+            Files.deleteIfExists(sharedProperties);
+        }
+        System.out.println("Verified concurrent Overworld creation, seed selection, and local save isolation");
     }
 
     private static void checkTerrainAuthority() {

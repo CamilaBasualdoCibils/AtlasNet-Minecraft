@@ -2,7 +2,7 @@
   "required": true,
   "package": "net.atlasnet.minecraft.fabric.mixin",
   "compatibilityLevel": "JAVA_21",
-  "server": ["DedicatedServerMixin", "ShardWorldsMixin", "ChunkStorageMixin", "LevelChunkLifecycleMixin", "ServerLevelChunkUnloadMixin", "ChunkHolderTerrainMixin", "ServerConnectionAccessor", "ServerTerrainTickerMixin", "NaturalSpawnerAuthorityMixin", "ServerTerrainMutationMixin", "PlayerTransferDataMixin", "ChunkTransferAccessor", "ShardActorTrackingMixin", "ShardActorTickMixin", "ShardActorPickupMixin", "ShardActorVanillaTrackingMixin", "ShardArrowCollisionAccessor", "ShardProjectileOwnerMixin", "ShardItemTransferMixin"],
-  "client": ["ConnectScreenMixin", "ServerStatusPingerMixin", "ClientChatMixin", "RegionHudMixin", "RegionOutlineMixin", "EntityRemovalAccessor", "InteractPacketAccessor"],
+  "server": ["DedicatedServerMixin", "ShardWorldsMixin", "ChunkStorageMixin", "LevelChunkLifecycleMixin", "ServerLevelChunkUnloadMixin", "ChunkHolderTerrainMixin", "ServerConnectionAccessor", "ShardKeepAliveMixin", "ServerTerrainTickerMixin", "NaturalSpawnerAuthorityMixin", "ServerTerrainMutationMixin", "PlayerTransferDataMixin", "ChunkTransferAccessor", "ShardActorTrackingMixin", "ShardActorPickupMixin", "PlayerEquipmentDropMixin", "ShardActorVanillaTrackingMixin", "ShardProjectileCollisionAccessor", "ShardProjectileOwnerMixin", "ShardItemTransferMixin"],
+  "client": ["ConnectScreenMixin", "ServerStatusPingerMixin", "ClientChatMixin", "RegionHudMixin", "RegionOutlineMixin", "EntityRemovalAccessor", "InteractPacketAccessor", "LocalPlayerGameModeMixin", "LocalPlayerTerrainMixin"],
   "injectors": {"defaultRequire": 1}
 }

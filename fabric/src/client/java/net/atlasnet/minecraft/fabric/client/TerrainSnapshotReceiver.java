@@ -9,13 +9,14 @@ import net.minecraft.world.level.ChunkPos;
 
 /** Buffers complete owner snapshots until the vanilla chunk tracking window catches up. */
 final class TerrainSnapshotReceiver {
-    private static final int MAX_IN_FLIGHT = 4;
+    private static final int MAX_IN_FLIGHT_BYTES = 32 * 1024 * 1024;
     private static final int MAX_PENDING_BYTES = 16 * 1024 * 1024;
 
     private final LinkedHashMap<Transfer, Assembly> incoming = new LinkedHashMap<>();
     private final LinkedHashMap<ChunkPos, ArrayDeque<byte[]>> pending = new LinkedHashMap<>();
     private long viewer;
     private int pendingBytes;
+    private int inFlightBytes;
 
     void setViewer(long viewer) {
         this.viewer = viewer;
@@ -25,6 +26,7 @@ final class TerrainSnapshotReceiver {
         incoming.clear();
         pending.clear();
         pendingBytes = 0;
+        inFlightBytes = 0;
     }
 
     void accept(TerrainSnapshotSignal part) {
@@ -32,25 +34,27 @@ final class TerrainSnapshotReceiver {
             return;
         }
         var pos = new ChunkPos(part.x(), part.z());
-        var transfer = new Transfer(part.sequence(), pos);
+        var transfer = new Transfer(part.sourceHigh(), part.sourceLow(), part.sequence(), pos);
         if (part.offset() == 0) {
-            if (incoming.size() == MAX_IN_FLIGHT) {
-                incoming.pollFirstEntry();
+            remove(transfer);
+            while (inFlightBytes + part.size() > MAX_IN_FLIGHT_BYTES) {
+                inFlightBytes -= incoming.pollFirstEntry().getValue().bytes.length;
             }
             incoming.put(transfer, new Assembly(part.size()));
+            inFlightBytes += part.size();
         }
         var assembly = incoming.get(transfer);
         if (assembly == null) {
             return;
         }
         if (part.offset() != assembly.offset || part.size() != assembly.bytes.length) {
-            incoming.remove(transfer);
+            remove(transfer);
             return;
         }
         System.arraycopy(part.bytes(), 0, assembly.bytes, assembly.offset, part.bytes().length);
         assembly.offset += part.bytes().length;
         if (assembly.offset == assembly.bytes.length) {
-            incoming.remove(transfer);
+            remove(transfer);
             pending.computeIfAbsent(pos, ignored -> new ArrayDeque<>()).add(assembly.bytes);
             pendingBytes += assembly.bytes.length;
             while (pendingBytes > MAX_PENDING_BYTES) {
@@ -77,7 +81,13 @@ final class TerrainSnapshotReceiver {
     }
 
     void forget(ChunkPos pos) {
-        incoming.keySet().removeIf(transfer -> transfer.pos().equals(pos));
+        incoming.entrySet().removeIf(entry -> {
+            if (!entry.getKey().pos().equals(pos)) {
+                return false;
+            }
+            inFlightBytes -= entry.getValue().bytes.length;
+            return true;
+        });
         var packets = pending.remove(pos);
         if (packets != null) {
             discard(packets);
@@ -90,7 +100,14 @@ final class TerrainSnapshotReceiver {
         }
     }
 
-    private record Transfer(long sequence, ChunkPos pos) {}
+    private void remove(Transfer transfer) {
+        var removed = incoming.remove(transfer);
+        if (removed != null) {
+            inFlightBytes -= removed.bytes.length;
+        }
+    }
+
+    private record Transfer(long sourceHigh, long sourceLow, long sequence, ChunkPos pos) {}
 
     private static final class Assembly {
         private final byte[] bytes;

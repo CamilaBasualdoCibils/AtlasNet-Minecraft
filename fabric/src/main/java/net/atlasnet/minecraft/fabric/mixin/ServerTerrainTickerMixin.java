@@ -1,5 +1,6 @@
 package net.atlasnet.minecraft.fabric.mixin;
 
+import net.atlasnet.minecraft.fabric.server.ShardActors;
 import net.atlasnet.minecraft.fabric.server.ShardPlayers;
 import net.atlasnet.minecraft.fabric.server.storage.ShardChunkIO;
 import net.minecraft.server.level.ServerLevel;
@@ -32,6 +33,7 @@ abstract class ServerTerrainTickerMixin {
     @Inject(method = "tickNonPassenger", at = @At("HEAD"), cancellable = true)
     private void checkEntityTickAuthority(Entity entity, CallbackInfo callback) {
         if (entity instanceof ServerPlayer player ? ShardPlayers.isFrozen(player)
+                : ShardActors.managed(entity) ? ShardActors.frozen(entity)
                 : !ShardChunkIO.ownsTerrain(entity.chunkPosition().toLong())) {
             callback.cancel();
         }

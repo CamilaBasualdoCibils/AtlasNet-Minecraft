@@ -31,7 +31,15 @@ import net.minecraft.network.protocol.game.ClientboundSystemChatPacket;
 import net.minecraft.network.protocol.game.ClientboundChunkBatchFinishedPacket;
 import net.minecraft.network.protocol.game.ClientboundForgetLevelChunkPacket;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
+import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
+import net.minecraft.network.protocol.game.ClientboundRespawnPacket;
+import net.minecraft.network.protocol.game.ClientboundChunkBatchStartPacket;
+import net.minecraft.network.protocol.game.ClientboundLightUpdatePacket;
+import net.minecraft.network.protocol.game.ClientboundSetChunkCacheCenterPacket;
+import net.minecraft.network.protocol.game.ClientboundSetChunkCacheRadiusPacket;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.levelgen.Heightmap;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.HashMap;
@@ -45,6 +53,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import io.netty.buffer.Unpooled;
 import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.protocol.BundlePacket;
 import net.minecraft.network.protocol.configuration.ConfigurationProtocols;
 import net.minecraft.network.protocol.configuration.ClientboundFinishConfigurationPacket;
@@ -52,7 +62,7 @@ import net.minecraft.network.protocol.configuration.ClientboundUpdateEnabledFeat
 import net.minecraft.network.protocol.game.GameProtocols;
 import net.minecraft.network.protocol.game.ServerboundAcceptTeleportationPacket;
 import net.minecraft.network.protocol.game.ServerboundChunkBatchReceivedPacket;
-import net.minecraft.network.protocol.common.ServerboundKeepAlivePacket;
+import net.minecraft.network.protocol.game.ServerboundContainerClickPacket;
 import net.minecraft.server.network.config.SynchronizeRegistriesTask;
 import net.minecraft.world.flag.FeatureFlags;
 import java.util.Map;
@@ -68,9 +78,15 @@ import net.minecraft.server.dedicated.DedicatedServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.level.ChunkTrackingView;
 import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.network.protocol.game.ServerboundUseItemOnPacket;
+import net.minecraft.network.protocol.game.ServerboundSwingPacket;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.EquipmentSlot;
 
 public final class ShardPlayers {
     private static final ResourceKey<Level> OVERWORLD = ResourceKey.create(
@@ -78,6 +94,7 @@ public final class ShardPlayers {
     private static volatile DedicatedServer server;
     private static final Map<Long, ServerPlayer> players = new HashMap<>();
     private static final Set<ServerPlayer> frozen = new HashSet<>();
+    private static final Set<Long> disconnectingAfterUse = new HashSet<>();
     private static final Map<Long, StagedPlayer> staged = new HashMap<>();
     private static final int MAX_PLAYER_NBT = 2 * 1024 * 1024;
     private static ServerPlayer loadingTransfer;
@@ -85,14 +102,16 @@ public final class ShardPlayers {
     private static final Map<Long, ShardConnection> connections = new ConcurrentHashMap<>();
     private static final ChunkDemandManager chunkDemand = new ChunkDemandManager();
     private static final RemoteTerrainBreaks remoteTerrainBreaks = new RemoteTerrainBreaks();
+    private static final RemoteTerrainUses remoteTerrainUses = new RemoteTerrainUses();
+    private static final TerrainCollisionReplicas collisionReplicas = new TerrainCollisionReplicas();
     private static final CrossShardMelee crossShardMelee = new CrossShardMelee();
 
     private ShardPlayers() {
     }
 
     public static int trackingRange() {
-        return Math.min(net.minecraft.world.entity.EntityType.PLAYER.clientTrackingRange(),
-                server.getPlayerList().getViewDistance()) * 16;
+        // Keep entity interest bounded independently of the terrain streaming radius.
+        return Math.min(5, server.getPlayerList().getViewDistance()) * 16;
     }
 
     public static void ready(DedicatedServer dedicatedServer) {
@@ -209,6 +228,29 @@ public final class ShardPlayers {
         chunkDemand.sendRemoteTerrain(server, pos, packet);
     }
 
+    public static void recordCollisionChanges(ChunkPos pos, Packet<?> packet) {
+        collisionReplicas.capture(pos, packet);
+    }
+
+    public static void collisionReplicaLoaded(LevelChunk chunk) {
+        collisionReplicas.chunkLoaded(chunk);
+    }
+
+    public static void collisionReplicaUnloaded(ChunkPos pos) {
+        collisionReplicas.chunkUnloaded(pos);
+    }
+
+    public static byte[] nextCollisionChanges() {
+        return collisionReplicas.next();
+    }
+
+    public static void applyCollisionChanges(byte[] changes) {
+        var current = server;
+        if (current != null && current.isRunning()) {
+            current.execute(() -> collisionReplicas.receive(current.overworld(), changes));
+        }
+    }
+
     public static boolean spawn(long clientId, long entityId, String dimension, double x, double y, double z) {
         DedicatedServer current = server;
         if (current == null || !current.isRunning() || !AtlasNetWorlds.OVERWORLD_DIMENSION.equals(dimension)) {
@@ -220,8 +262,15 @@ public final class ShardPlayers {
             }
             var profile = profile(clientId);
             var cookie = CommonListenerCookie.createInitial(profile, false);
-            var player = new ServerPlayer(current, current.getLevel(OVERWORLD), profile, cookie.clientInformation());
+            var level = current.overworld();
+            var player = new ServerPlayer(current, level, profile, cookie.clientInformation());
             player.moveTo(x, y, z, 0, 0);
+            if (ShardChunkIO.current() != null && !level.noCollision(player)) {
+                int surface = level.getHeight(Heightmap.Types.MOTION_BLOCKING, player.getBlockX(), player.getBlockZ());
+                if (surface > y) {
+                    player.moveTo(x, surface, z, 0, 0);
+                }
+            }
             var connection = new ShardConnection(current);
             connection.configure(current);
             current.getPlayerList().placeNewPlayer(connection, player, cookie);
@@ -239,18 +288,35 @@ public final class ShardPlayers {
     public static byte[] freezePlayer(long entityId, int maxBytes) {
         return server.submit(() -> {
             var player = players.get(entityId);
+            var connection = connections.get(entityId);
             if (player == null || !player.isAlive() || player.isPassenger() || player.isVehicle()
-                    || player.isSleeping()) {
+                    || player.isSleeping() || connection == null || connection.hasPendingTeleport()
+                    || remoteTerrainUses.pending(entityId)) {
                 return null;
             }
             try {
                 var data = player.saveWithoutId(new CompoundTag());
+                data.putBoolean("AtlasNetSprinting", player.isSprinting());
+                data.putBoolean("AtlasNetCrouching", player.isShiftKeyDown());
+                data.putInt("AtlasNetMainSwing", connection.mainSwing);
+                data.putInt("AtlasNetOffSwing", connection.offSwing);
+                data.putLong("AtlasNetMovementSequence", connection.lastMovementSequence);
+                var preferences = new FriendlyByteBuf(Unpooled.buffer());
+                try {
+                    player.clientInformation().write(preferences);
+                    byte[] bytes = new byte[preferences.readableBytes()];
+                    preferences.readBytes(bytes);
+                    data.putByteArray("AtlasNetClientInformation", bytes);
+                } finally {
+                    preferences.release();
+                }
+                remoteTerrainBreaks.save(entityId, player, data);
                 var bytes = new ByteArrayOutputStream();
                 NbtIo.writeCompressed(data, bytes);
                 if (bytes.size() > maxBytes) {
                     return null;
                 }
-                connections.get(entityId).recordPose(player);
+                connection.recordPose(player);
                 frozen.add(player);
                 return bytes.toByteArray();
             } catch (IOException error) {
@@ -271,7 +337,14 @@ public final class ShardPlayers {
             try {
                 var tag = NbtIo.readCompressed(new ByteArrayInputStream(data), NbtAccounter.create(MAX_PLAYER_NBT));
                 var profile = profile(clientId);
-                var cookie = CommonListenerCookie.createInitial(profile, false);
+                var preferences = new FriendlyByteBuf(Unpooled.wrappedBuffer(
+                        tag.getByteArray("AtlasNetClientInformation")));
+                CommonListenerCookie cookie;
+                try {
+                    cookie = new CommonListenerCookie(profile, 0, new ClientInformation(preferences), false);
+                } finally {
+                    preferences.release();
+                }
                 var player = new ServerPlayer(current, current.overworld(), profile, cookie.clientInformation());
                 if (!tag.hasUUID("UUID") || !profile.getId().equals(tag.getUUID("UUID"))) {
                     return false;
@@ -292,6 +365,10 @@ public final class ShardPlayers {
                 return players.containsKey(entityId);
             }
             var connection = new ShardConnection(server);
+            connection.handoffLogin = true;
+            connection.mainSwing = incoming.tag().getInt("AtlasNetMainSwing");
+            connection.offSwing = incoming.tag().getInt("AtlasNetOffSwing");
+            connection.lastMovementSequence = incoming.tag().getLong("AtlasNetMovementSequence");
             loadingTransfer = incoming.player();
             transferTag = incoming.tag();
             try {
@@ -300,6 +377,9 @@ public final class ShardPlayers {
                 loadingTransfer = null;
                 transferTag = null;
             }
+            incoming.player().setSprinting(incoming.tag().getBoolean("AtlasNetSprinting"));
+            incoming.player().setShiftKeyDown(incoming.tag().getBoolean("AtlasNetCrouching"));
+            remoteTerrainBreaks.restore(entityId, incoming.player(), incoming.tag());
             connection.recordPose(incoming.player());
             connections.put(entityId, connection);
             players.put(entityId, incoming.player());
@@ -314,6 +394,22 @@ public final class ShardPlayers {
 
     public static boolean isFrozen(ServerPlayer player) {
         return frozen.contains(player);
+    }
+
+    public static boolean ownsConnection(Connection connection) {
+        return connection instanceof ShardConnection;
+    }
+
+    public static boolean inventoryReserved(ServerPlayer player) {
+        return remoteTerrainUses.inventoryReserved(player);
+    }
+
+    public static boolean deferEquipmentDrop(ServerPlayer player) {
+        return remoteTerrainUses.deferEquipmentDrop(player);
+    }
+
+    public interface EquipmentDropAccess {
+        void atlasnet$dropEquipment();
     }
 
     public static void abortPlayerTransfer(long entityId, boolean source) {
@@ -340,6 +436,7 @@ public final class ShardPlayers {
             connections.remove(entityId);
             frozen.remove(player);
             crossShardMelee.discard(player);
+            remoteTerrainBreaks.discard(entityId);
             return true;
         }).join();
     }
@@ -353,17 +450,28 @@ public final class ShardPlayers {
         }
         connections.remove(entityId);
         current.execute(() -> {
-            ServerPlayer player = players.remove(entityId);
-            if (player != null) {
-                frozen.remove(player);
-                crossShardMelee.discard(player);
-                current.getPlayerList().remove(player);
+            if (remoteTerrainUses.pending(entityId)) {
+                disconnectingAfterUse.add(entityId);
+                frozen.add(players.get(entityId));
+            } else {
+                removeDisconnectedPlayer(current, entityId);
             }
         });
     }
 
+    private static void removeDisconnectedPlayer(DedicatedServer current, long entity) {
+        var player = players.remove(entity);
+        if (player != null) {
+            frozen.remove(player);
+            crossShardMelee.discard(player);
+            remoteTerrainBreaks.discard(entity);
+            current.getPlayerList().remove(player);
+        }
+    }
+
     public static byte[] prepareMelee(long entity) {
-        return server.submit(() -> crossShardMelee.prepare(players.get(entity))).join();
+        return server.submit(() -> remoteTerrainUses.pending(entity) ? null
+                : crossShardMelee.prepare(players.get(entity))).join();
     }
 
     public static byte[] applyMelee(long target, byte[] state) {
@@ -401,6 +509,8 @@ public final class ShardPlayers {
 
     public static void tick() {
         ShardActors.sample();
+        chunkDemand.tick(server);
+        remoteTerrainBreaks.tick(players, remoteTerrainUses);
         for (var entry : players.entrySet()) {
             ShardConnection connection = connections.get(entry.getKey());
             if (connection == null || isFrozen(entry.getValue())) {
@@ -457,53 +567,74 @@ public final class ShardPlayers {
         return ProtocolRegistry.SHARD_METRICS.encode(new ShardMetricsSignal(UUID.fromString(shardId)));
     }
 
-    public static void receivePacket(long entityId, byte[] bytes, int command) {
+    public static void receivePacket(long entityId, byte[] bytes, int command, boolean previousEpoch) {
         DedicatedServer current = server;
         ShardConnection connection = connections.get(entityId);
         if (current != null && connection != null) {
             current.execute(() -> {
                 var player = players.get(entityId);
                 if (connections.get(entityId) == connection && player != null && !isFrozen(player)) {
-                    connection.receive(bytes, command, entityId, player);
+                    if (previousEpoch) {
+                        connection.queueHandoffInput(bytes, command);
+                    } else {
+                        connection.receive(bytes, command, entityId, player);
+                    }
                 }
             });
         }
     }
 
-    public static long[] nextRemoteBreak() {
-        return remoteTerrainBreaks.next();
+    public static byte[] nextRemoteTerrainUse() {
+        return remoteTerrainUses.next();
     }
 
-    public static int breakTerrainBlock(int x, int y, int z) {
-        DedicatedServer current = server;
+    public static byte[] applyRemoteTerrainUse(long target, byte[] request) {
+        var current = server;
         if (current == null || !current.isRunning()) {
-            return -1;
+            return null;
         }
-        return current.submit(() -> RemoteTerrainBreaks.breakBlock(
-                current.overworld(), new BlockPos(x, y, z))).join();
+        return current.submit(() -> RemoteTerrainUses.apply(current.overworld(), BlockPos.of(target), request)).join();
     }
 
-    public static void completeRemoteBreak(long entity, int x, int y, int z, int sequence, int state) {
-        DedicatedServer current = server;
+    public static void completeRemoteTerrainUse(long entity, byte[] result) {
+        var current = server;
         if (current != null && current.isRunning()) {
-            current.execute(() -> remoteTerrainBreaks.complete(
-                    entity, players.get(entity), new BlockPos(x, y, z), sequence, state));
+            current.execute(() -> {
+                remoteTerrainUses.complete(entity, result, remoteTerrainBreaks);
+                if (!remoteTerrainUses.pending(entity) && disconnectingAfterUse.remove(entity)) {
+                    removeDisconnectedPlayer(current, entity);
+                    return;
+                }
+                var connection = connections.get(entity);
+                if (connection != null) {
+                    connection.resumeInteractions(entity);
+                }
+            });
         }
     }
 
-    private record Pose(double x, double y, double z, float yaw, float pitch, float head, int flags) {}
+    private record Pose(double x, double y, double z, float yaw, float pitch, float head, int flags,
+                        int mainSwing, int offSwing, int mainItem, int offItem, int headItem, int chestItem,
+                        int legsItem, int feetItem) {}
     private record ChunkWindow(int x, int z, int view, int simulation) {}
 
     public static double[] takePose(long entityId) {
         ShardConnection connection = connections.get(entityId);
         var position = connection == null ? null : connection.transform.getAndSet(null);
         return position == null ? null : new double[] {position.x(), position.y(), position.z(),
-                position.yaw(), position.pitch(), position.head(), position.flags()};
+                position.yaw(), position.pitch(), position.head(), position.flags(),
+                position.mainSwing(), position.offSwing(), position.mainItem(), position.offItem(),
+                position.headItem(), position.chestItem(), position.legsItem(), position.feetItem()};
     }
 
     public static byte[] nextPacket(long entityId) {
         ShardConnection connection = connections.get(entityId);
         return connection == null ? null : connection.outbound.poll();
+    }
+
+    public static byte[] nextPlayTerrainPacket(long entityId) {
+        ShardConnection connection = connections.get(entityId);
+        return connection == null || !connection.playAcknowledged ? null : connection.terrain.poll();
     }
 
     public static void sendTrackedTerrain(ServerPlayer viewer, ChunkPos chunk, Packet<?> packet) {
@@ -518,11 +649,23 @@ public final class ShardPlayers {
         private static final SocketAddress LOCAL = new InetSocketAddress("127.0.0.1", 0);
 
         private final ConcurrentLinkedQueue<byte[]> outbound = new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<byte[]> terrain = new ConcurrentLinkedQueue<>();
         private final AtomicReference<Pose> transform = new AtomicReference<>();
         private final AtomicReference<ChunkWindow> demand = new AtomicReference<>();
         private final Map<ChunkPos, ChunkDelivery> deliveredTerrain = new HashMap<>();
         private final ArrayDeque<List<ChunkDelivery>> pendingTerrainBatches = new ArrayDeque<>();
         private final List<ChunkDelivery> currentTerrainBatch = new ArrayList<>();
+        private final ArrayDeque<DeferredInteraction> deferredInteractions = new ArrayDeque<>();
+        private final ArrayDeque<DeferredInteraction> handoffInputs = new ArrayDeque<>();
+        private boolean handoffLogin;
+        private volatile boolean playAcknowledged;
+        private int mainSwing;
+        private int offSwing;
+        private long lastMovementSequence;
+        private int handoffTeleport = -1;
+        private boolean awaitingRespawnPosition;
+        private int respawnTeleport = -1;
+        private int pendingTeleport = -1;
         private Pose lastPose;
         private ChunkWindow lastDemand;
         private final ProtocolInfo<?> play;
@@ -535,13 +678,26 @@ public final class ShardPlayers {
         }
 
         void recordPose(ServerPlayer player) {
+            if (hasPendingTeleport()) {
+                return;
+            }
             var pose = new Pose(player.getX(), player.getY(), player.getZ(), player.getYRot(),
                     player.getXRot(), player.getYHeadRot(), (player.isShiftKeyDown() ? 1 : 0)
-                    | (player.isSprinting() ? 2 : 0) | (player.onGround() ? 4 : 0));
+                    | (player.isSprinting() ? 2 : 0) | (player.onGround() ? 4 : 0)
+                    | (player.getAbilities().flying ? 8 : 0) | (player.isUsingItem() ? 16 : 0)
+                    | (player.isUsingItem() && player.getUsedItemHand() == InteractionHand.OFF_HAND ? 32 : 0)
+                    | (player.isSwimming() ? 64 : 0) | (player.isFallFlying() ? 128 : 0),
+                    mainSwing, offSwing, itemId(player, EquipmentSlot.MAINHAND), itemId(player, EquipmentSlot.OFFHAND),
+                    itemId(player, EquipmentSlot.HEAD), itemId(player, EquipmentSlot.CHEST),
+                    itemId(player, EquipmentSlot.LEGS), itemId(player, EquipmentSlot.FEET));
             if (!pose.equals(lastPose)) {
                 lastPose = pose;
                 transform.set(pose);
             }
+        }
+
+        private static int itemId(ServerPlayer player, EquipmentSlot slot) {
+            return BuiltInRegistries.ITEM.getId(player.getItemBySlot(slot).getItem());
         }
 
         void recordDemand(ServerPlayer player) {
@@ -569,10 +725,14 @@ public final class ShardPlayers {
         }
 
         private void enqueue(boolean spatial, byte[] payload) {
+            enqueue(outbound, spatial, payload);
+        }
+
+        private static void enqueue(ConcurrentLinkedQueue<byte[]> queue, boolean spatial, byte[] payload) {
             byte[] framed = new byte[payload.length + 1];
             framed[0] = (byte) (spatial ? 1 : 0);
             System.arraycopy(payload, 0, framed, 1, payload.length);
-            outbound.add(framed);
+            queue.add(framed);
         }
 
         @SuppressWarnings({"unchecked", "rawtypes"})
@@ -595,7 +755,7 @@ public final class ShardPlayers {
                     && data.length + TerrainUpdateSignal.HEADER_BYTES <= TerrainUpdateSignal.MAX_BYTES) {
                 enqueue(true, new TerrainUpdateSignal(chunk.x, chunk.z, viewer, data).encode());
             } else {
-                enqueue(false, data);
+                enqueue(terrain, false, data);
             }
         }
 
@@ -635,8 +795,20 @@ public final class ShardPlayers {
 
         @SuppressWarnings({"rawtypes", "unchecked"})
         void receive(byte[] bytes, int command, long entity, ServerPlayer player) {
+            if ((command == PlayerInputCommand.ID || command == BlockInteractionCommand.ID)
+                    && queueHandoffInput(bytes, command)) {
+                return;
+            }
+            if ((command == BlockInteractionCommand.ID || command == GameplayInputCommand.ID)
+                    && remoteTerrainUses.pending(entity)) {
+                if (deferredInteractions.size() < 128) {
+                    deferredInteractions.addLast(new DeferredInteraction(bytes, command));
+                }
+                return;
+            }
             var buffer = Unpooled.wrappedBuffer(bytes);
             try {
+                long sequence = command == PlayerInputCommand.ID ? buffer.readLong() : 0;
                 Packet packet = inbound.codec().decode(buffer);
                 if (buffer.isReadable()) {
                     return;
@@ -646,30 +818,66 @@ public final class ShardPlayers {
                     case GameplayInputCommand.ID -> GameplayInputCommand.supports(packet);
                     case BlockInteractionCommand.ID -> ShardChunkIO.current() != null
                             && BlockInteractionCommand.supports(packet);
-                    default -> packet instanceof ServerboundKeepAlivePacket
-                            || packet instanceof ServerboundAcceptTeleportationPacket
+                    default -> packet instanceof ServerboundAcceptTeleportationPacket
                             || packet instanceof ServerboundChunkBatchReceivedPacket;
                 };
                 if (allowed) {
-                    if (command == BlockInteractionCommand.ID && player != null
-                            && packet instanceof ServerboundPlayerActionPacket action
-                            && remoteTerrainBreaks.intercept(entity, player, action)) {
+                    if (packet instanceof ServerboundMovePlayerPacket) {
+                        if (sequence <= lastMovementSequence) {
+                            return;
+                        }
+                        lastMovementSequence = sequence;
+                    }
+                    if (command == GameplayInputCommand.ID && packet instanceof ServerboundContainerClickPacket click
+                            && remoteTerrainUses.chestClick(entity, player, click)) {
                         return;
                     }
                     if (command == BlockInteractionCommand.ID && player != null
-                            && packet instanceof ServerboundUseItemOnPacket use) {
-                        var hit = use.getHitResult();
-                        var clicked = hit.getBlockPos();
-                        if (!ShardChunkIO.ownsTerrain(ChunkPos.asLong(clicked))
-                                || !ShardChunkIO.ownsTerrain(ChunkPos.asLong(clicked.relative(hit.getDirection())))) {
-                            player.connection.ackBlockChangesUpTo(use.getSequence());
-                            return;
-                        }
+                            && packet instanceof ServerboundPlayerActionPacket action
+                            && remoteTerrainBreaks.intercept(entity, player, action, remoteTerrainUses)) {
+                        return;
+                    }
+                    if (command == BlockInteractionCommand.ID && player != null
+                            && packet instanceof ServerboundUseItemOnPacket use
+                            && remoteTerrainUses.intercept(entity, player, use)) {
+                        return;
                     }
                     if (packet instanceof ServerboundChunkBatchReceivedPacket && !pendingTerrainBatches.isEmpty()) {
                         pendingTerrainBatches.removeFirst().forEach(delivery -> delivery.acknowledged = true);
                     }
                     packet.handle(packetListener);
+                    if (packet instanceof ServerboundSwingPacket swing) {
+                        if (swing.getHand() == InteractionHand.MAIN_HAND) {
+                            ++mainSwing;
+                        } else {
+                            ++offSwing;
+                        }
+                    }
+                    if (packetListener instanceof ServerGamePacketListenerImpl game && player != game.player
+                            && players.replace(entity, player, game.player)) {
+                        // Vanilla respawn replaces ServerPlayer while retaining its listener and entity ID.
+                        remoteTerrainBreaks.discard(entity);
+                        crossShardMelee.discard(player);
+                        player = game.player;
+                    }
+                    if (packet instanceof ServerboundAcceptTeleportationPacket ack) {
+                        playAcknowledged = true;
+                        if (respawnTeleport == ack.getId()) {
+                            respawnTeleport = -1;
+                            recordPose(player);
+                        }
+                        if (pendingTeleport == ack.getId()) {
+                            pendingTeleport = -1;
+                            recordPose(player);
+                        }
+                        if (handoffTeleport == ack.getId()) {
+                            handoffTeleport = -1;
+                            while (!handoffInputs.isEmpty()) {
+                                var input = handoffInputs.removeFirst();
+                                receive(input.bytes(), input.id(), entity, player);
+                            }
+                        }
+                    }
                 }
             } catch (io.netty.handler.codec.DecoderException | IndexOutOfBoundsException invalid) {
                 // Ignore malformed application input.
@@ -677,6 +885,37 @@ public final class ShardPlayers {
                 buffer.release();
             }
         }
+
+        boolean respawnPending() {
+            return awaitingRespawnPosition || respawnTeleport >= 0;
+        }
+
+        boolean hasPendingTeleport() {
+            return respawnPending() || pendingTeleport >= 0;
+        }
+
+        boolean queueHandoffInput(byte[] bytes, int command) {
+            if (handoffTeleport < 0) {
+                return false;
+            }
+            if (handoffInputs.size() < 128) {
+                handoffInputs.addLast(new DeferredInteraction(bytes, command));
+            }
+            return true;
+        }
+
+        void resumeInteractions(long entity) {
+            while (!deferredInteractions.isEmpty() && !remoteTerrainUses.pending(entity)) {
+                var player = players.get(entity);
+                if (player == null) {
+                    return;
+                }
+                var command = deferredInteractions.removeFirst();
+                receive(command.bytes(), command.id(), entity, player);
+            }
+        }
+
+        private record DeferredInteraction(byte[] bytes, int id) {}
 
         @Override
         public void flushChannel() {
@@ -691,10 +930,36 @@ public final class ShardPlayers {
             if (packet instanceof BundlePacket<?> bundle) {
                 bundle.subPackets().forEach(part -> encode(play, part));
             } else {
+                if (packet instanceof ClientboundRespawnPacket) {
+                    playAcknowledged = false;
+                    pendingTeleport = -1;
+                    awaitingRespawnPosition = true;
+                } else if (packet instanceof ClientboundPlayerPositionPacket position) {
+                    if (handoffLogin) {
+                        handoffLogin = false;
+                        handoffTeleport = position.getId();
+                    }
+                    if (respawnPending()) {
+                        awaitingRespawnPosition = false;
+                        respawnTeleport = position.getId();
+                    } else if (playAcknowledged) {
+                        pendingTeleport = position.getId();
+                    }
+                }
                 if (ShardChunkIO.current() != null) {
                     recordTerrainDelivery(packet);
                 }
-                encode(play, packet);
+                if (packet instanceof ClientboundLevelChunkWithLightPacket
+                        || packet instanceof ClientboundChunkBatchStartPacket
+                        || packet instanceof ClientboundChunkBatchFinishedPacket
+                        || packet instanceof ClientboundForgetLevelChunkPacket
+                        || packet instanceof ClientboundLightUpdatePacket
+                        || packet instanceof ClientboundSetChunkCacheCenterPacket
+                        || packet instanceof ClientboundSetChunkCacheRadiusPacket) {
+                    enqueue(terrain, false, encodePacket(play, packet));
+                } else {
+                    encode(play, packet);
+                }
             }
         }
 

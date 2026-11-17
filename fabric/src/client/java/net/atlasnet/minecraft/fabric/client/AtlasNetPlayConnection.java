@@ -1,6 +1,7 @@
 package net.atlasnet.minecraft.fabric.client;
 
 import io.netty.buffer.Unpooled;
+import java.util.ArrayDeque;
 import java.util.Map;
 import java.util.Arrays;
 import java.nio.ByteBuffer;
@@ -25,13 +26,16 @@ import net.minecraft.network.protocol.game.ServerboundAcceptTeleportationPacket;
 import net.minecraft.network.protocol.game.ServerboundChunkBatchReceivedPacket;
 import net.minecraft.network.protocol.game.ClientboundForgetLevelChunkPacket;
 import net.minecraft.network.protocol.game.ClientboundLoginPacket;
+import net.minecraft.network.protocol.common.ServerboundClientInformationPacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerAbilitiesPacket;
+import net.minecraft.network.ConnectionProtocol;
 import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.atlasnet.minecraft.fabric.mixin.EntityRemovalAccessor;
-import net.minecraft.network.protocol.common.ServerboundKeepAlivePacket;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.multiplayer.ClientConfigurationPacketListenerImpl;
@@ -63,6 +67,7 @@ public final class AtlasNetPlayConnection extends Connection {
     private final Map<Long, PlayerPoseSignal> pendingVisibility = new java.util.HashMap<>();
     private final Runnable close;
     private final ConcurrentLinkedQueue<Command> outbound = new ConcurrentLinkedQueue<>();
+    private final ArrayDeque<MotionSample> recentMotion = new ArrayDeque<>();
     private ProtocolInfo<?> outboundProtocol;
     private ProtocolInfo<?> protocol;
     private PacketListener listener;
@@ -71,6 +76,7 @@ public final class AtlasNetPlayConnection extends Connection {
     private boolean showMetrics = true;
     private boolean worldReady;
     private long playEpoch;
+    private long movementSequence;
     private boolean awaitingHandoffLogin;
     private boolean awaitingHandoffPosition;
     private PlayerRegionSignal region;
@@ -144,23 +150,41 @@ public final class AtlasNetPlayConnection extends Connection {
         boolean playerInput = PlayerInputCommand.supports(packet);
         boolean blockInteraction = BlockInteractionCommand.supports(packet);
         boolean gameplayInput = GameplayInputCommand.supports(packet);
-        if (outboundProtocol == null || !(playerInput || blockInteraction || gameplayInput
-                || packet instanceof ServerboundKeepAlivePacket
+        if (outboundProtocol == null || (packet instanceof ServerboundClientInformationPacket
+                && outboundProtocol.id() != ConnectionProtocol.PLAY)
+                || !(playerInput || blockInteraction || gameplayInput
                 || packet instanceof ServerboundAcceptTeleportationPacket
                 || packet instanceof ServerboundChunkBatchReceivedPacket)) {
             return;
         }
+        long sequence = packet instanceof ServerboundMovePlayerPacket ? ++movementSequence : 0;
+        int id = gameplayInput ? GameplayInputCommand.ID : blockInteraction ? BlockInteractionCommand.ID
+                : playerInput ? PlayerInputCommand.ID : 0x4d430003;
+        enqueuePacket(packet, id, sequence);
+        if (packet instanceof ServerboundMovePlayerPacket move && move.hasPosition()) {
+            if (recentMotion.size() == 512) {
+                recentMotion.removeFirst();
+            }
+            recentMotion.addLast(new MotionSample(new Vec3(move.getX(0), move.getY(0), move.getZ(0)),
+                    move, sequence));
+        }
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private void enqueuePacket(Packet<?> packet, int id, long sequence) {
         var buffer = Unpooled.buffer();
         try {
             buffer.writeLong(playEpoch);
+            if (id == PlayerInputCommand.ID) {
+                buffer.writeLong(sequence);
+            }
             ((ProtocolInfo) outboundProtocol).codec().encode(buffer, packet);
-            if (gameplayInput && buffer.readableBytes() - Long.BYTES > GameplayInputCommand.MAX_PACKET_BYTES) {
+            if (id == GameplayInputCommand.ID
+                    && buffer.readableBytes() - Long.BYTES > GameplayInputCommand.MAX_PACKET_BYTES) {
                 return;
             }
             byte[] bytes = new byte[buffer.readableBytes()];
             buffer.readBytes(bytes);
-            int id = gameplayInput ? GameplayInputCommand.ID : blockInteraction ? BlockInteractionCommand.ID
-                    : playerInput ? PlayerInputCommand.ID : 0x4d430003;
             outbound.add(new Command(id, bytes));
         } finally {
             buffer.release();
@@ -189,12 +213,22 @@ public final class AtlasNetPlayConnection extends Connection {
 
     @Override
     public void disconnect(DisconnectionDetails details) {
+        DemoStartup.log("AtlasNet play connection closed: " + details.reason().getString());
         connected = false;
         close.run();
     }
 
     public PlayerRegionSignal visibleRegion() {
-        return connected && showRegion ? region : null;
+        return showsRegion() ? region : null;
+    }
+
+    public boolean waitingForInitialTerrain() {
+        return !worldReady && minecraft.level != null && minecraft.player != null
+                && !minecraft.level.hasChunkAt(minecraft.player.blockPosition());
+    }
+
+    public boolean showsRegion() {
+        return connected && showRegion;
     }
 
     public String visibleShardLabel() {
@@ -270,14 +304,23 @@ public final class AtlasNetPlayConnection extends Connection {
             }
             if (awaitingHandoffPosition && packet instanceof ClientboundPlayerPositionPacket position) {
                 awaitingHandoffPosition = false;
-                if (continueLocalMotion(position)) {
-                    return;
+                if (!continueLocalMotion(position)) {
+                    recentMotion.clear();
+                    packet.handle(listener);
                 }
+                sendHandoffPosture();
+                return;
+            }
+            if (packet instanceof ClientboundPlayerPositionPacket) {
+                recentMotion.clear();
             }
             if (packet instanceof ClientboundAddEntityPacket add && add.getType() == EntityType.PLAYER) {
                 remotePlayers.removeMatchingPlayer(minecraft.level, add.getUUID());
             }
             packet.handle(listener);
+            if (packet instanceof ClientboundLoginPacket) {
+                send(new ServerboundClientInformationPacket(minecraft.options.buildPlayerInformation()));
+            }
         } finally {
             buffer.release();
         }
@@ -308,7 +351,11 @@ public final class AtlasNetPlayConnection extends Connection {
             level.addEntity(player);
         }
         var info = login.commonPlayerSpawnInfo();
+        boolean flying = player.getAbilities().flying;
         minecraft.gameMode.setLocalMode(info.gameType(), info.previousGameType());
+        if (player.getAbilities().mayfly && flying) {
+            player.getAbilities().flying = true;
+        }
         player.setReducedDebugInfo(login.reducedDebugInfo());
         player.setShowDeathScreen(login.showDeathScreen());
         player.setDoLimitedCrafting(login.doLimitedCrafting());
@@ -318,17 +365,49 @@ public final class AtlasNetPlayConnection extends Connection {
 
     private boolean continueLocalMotion(ClientboundPlayerPositionPacket position) {
         var player = minecraft.player;
-        if (!position.getRelativeArguments().isEmpty()
-                || player.distanceToSqr(position.getX(), position.getY(), position.getZ()) > 4.0) {
+        var checkpoint = new Vec3(position.getX(), position.getY(), position.getZ());
+        if (!position.getRelativeArguments().isEmpty()) {
+            return false;
+        }
+        long checkpointSequence = 0;
+        for (var samples = recentMotion.descendingIterator(); samples.hasNext();) {
+            var sample = samples.next();
+            if (sample.position().distanceToSqr(checkpoint) < 0.01) {
+                checkpointSequence = sample.sequence();
+                break;
+            }
+        }
+        if (checkpointSequence == 0 && player.distanceToSqr(checkpoint) > 4.0) {
             return false;
         }
         // The destination restores the last accepted pose. Keep ordinary
         // client prediction and acknowledge the destination's new listener.
         send(new ServerboundAcceptTeleportationPacket(position.getId()));
+        if (checkpointSequence != 0) {
+            for (var sample : recentMotion) {
+                if (sample.sequence() > checkpointSequence) {
+                    enqueuePacket(sample.packet(), PlayerInputCommand.ID, sample.sequence());
+                }
+            }
+        }
         send(new ServerboundMovePlayerPacket.PosRot(player.getX(), player.getY(), player.getZ(),
                 player.getYRot(), player.getXRot(), player.onGround()));
         return true;
     }
+
+    private void sendHandoffPosture() {
+        var player = minecraft.player;
+        send(new ServerboundPlayerAbilitiesPacket(player.getAbilities()));
+        send(new ServerboundClientInformationPacket(minecraft.options.buildPlayerInformation()));
+        send(new ServerboundPlayerCommandPacket(player, player.isSprinting()
+                ? ServerboundPlayerCommandPacket.Action.START_SPRINTING
+                : ServerboundPlayerCommandPacket.Action.STOP_SPRINTING));
+        send(new ServerboundPlayerCommandPacket(player, player.isShiftKeyDown()
+                ? ServerboundPlayerCommandPacket.Action.PRESS_SHIFT_KEY
+                : ServerboundPlayerCommandPacket.Action.RELEASE_SHIFT_KEY));
+    }
+
+    private record MotionSample(Vec3 position, ServerboundMovePlayerPacket packet, long sequence) {}
 
     private void receiveNotice(int id, byte[] payload) {
         try {

@@ -81,9 +81,10 @@ final class ChunkDemandManager {
                 if (tracking.contains(pos)) {
                     remoteViewers.computeIfAbsent(pos, key -> new HashMap<>()).put(observer, viewDistance);
                     if (refresh || previous == null || !previous.remote() || !previous.canSee(pos)) {
-                        snapshots.capture(server, pos, observer, viewDistance, () -> {
+                        int distance = Math.max(Math.abs(x - pos.x), Math.abs(z - pos.z));
+                        snapshots.capture(pos, observer, viewDistance, distance, () -> {
                             var latest = observers.get(observer);
-                            return latest.remote() && latest.canSee(pos);
+                            return latest != null && latest.remote() && latest.canSee(pos);
                         });
                     }
                 }
@@ -99,6 +100,10 @@ final class ChunkDemandManager {
         return snapshots.next();
     }
 
+    void tick(DedicatedServer server) {
+        snapshots.tick(server);
+    }
+
     boolean remoteViewersPresent(ChunkPos pos) {
         return remoteViewers.containsKey(pos);
     }
@@ -106,7 +111,14 @@ final class ChunkDemandManager {
     void sendRemoteTerrain(DedicatedServer server, ChunkPos pos, Packet<?> packet) {
         var viewers = remoteViewers.get(pos);
         if (viewers != null) {
-            viewers.forEach((observer, view) -> snapshots.enqueue(server, pos, observer, view, packet));
+            viewers.forEach((observer, view) -> {
+                if (!snapshots.enqueue(server, pos, observer, view, packet)) {
+                    snapshots.capture(pos, observer, view, 0, () -> {
+                        var latest = observers.get(observer);
+                        return latest != null && latest.remote() && latest.canSee(pos);
+                    });
+                }
+            });
         }
     }
 

@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
@@ -26,6 +27,22 @@ public final class ValkeyChunkStorage implements ChunkStorage {
     private static final long MAX_NBT = 64L * 1024 * 1024;
     private static final int CONNECT_TIMEOUT = 1_000;
     private static final int READ_TIMEOUT = 3_000;
+    private static final String AUTHORITY_EPOCH = "minecraft:v1:authority-epoch";
+    private static final String OVERWORLD = "minecraft:v1:world:minecraft:overworld";
+
+    private static final String LOAD_OR_CREATE_WORLD = """
+            local world = redis.call('HMGET', KEYS[1], 'id', 'seed', 'preset')
+            if world[1] and world[2] and world[3] then return world end
+            if redis.call('EXISTS', KEYS[1]) ~= 0 then
+                return redis.error_reply('Incomplete Minecraft Overworld metadata')
+            end
+            local id, seed = ARGV[1], ARGV[2]
+            if redis.call('EXISTS', KEYS[2]) ~= 0 then
+                id, seed = 'legacy', ARGV[4]
+            end
+            redis.call('HSET', KEYS[1], 'id', id, 'seed', seed, 'preset', ARGV[3])
+            return {id, seed, ARGV[3]}
+            """;
 
     private static final String CLAIM = """
             local epoch = redis.call('HGET', KEYS[1], 'epoch')
@@ -140,8 +157,54 @@ public final class ValkeyChunkStorage implements ChunkStorage {
         this.address = address;
     }
 
+    static ValkeyChunkStorage local() {
+        var port = Integer.parseInt(System.getenv().getOrDefault("MINECRAFT_VALKEY_PORT",
+                terrainPreset().equals("flat") ? "46381" : "46382"));
+        return new ValkeyChunkStorage(new InetSocketAddress("127.0.0.1", port));
+    }
+
+    static String terrainPreset() {
+        return System.getenv().getOrDefault("MINECRAFT_TERRAIN_PRESET", "normal");
+    }
+
+    World loadOrCreateWorld(String preset) throws IOException {
+        long legacySeed = switch (preset) {
+            case "normal" -> 3955;
+            case "flat" -> 0;
+            default -> throw new IllegalArgumentException("Unknown Minecraft terrain preset " + preset);
+        };
+        // Pass seeds as decimal strings so Lua never rounds a signed 64-bit seed.
+        Object reply = execute(text("EVAL"), text(LOAD_OR_CREATE_WORLD), text("2"),
+                text(OVERWORLD), text(AUTHORITY_EPOCH), text(UUID.randomUUID().toString()),
+                text(Long.toString(ThreadLocalRandom.current().nextLong())), text(preset),
+                text(Long.toString(legacySeed)));
+        if (!(reply instanceof List<?> fields) || fields.size() != 3
+                || !(fields.get(0) instanceof byte[] idBytes) || !(fields.get(1) instanceof byte[] seedBytes)
+                || !(fields.get(2) instanceof byte[] presetBytes)) {
+            throw new IOException("Invalid Minecraft Overworld metadata in Valkey");
+        }
+        String storedPreset = new String(presetBytes, StandardCharsets.US_ASCII);
+        if (!preset.equals(storedPreset)) {
+            throw new IOException("Minecraft Valkey contains an Overworld with terrain preset " + storedPreset
+                    + ", expected " + preset);
+        }
+        try {
+            String id = new String(idBytes, StandardCharsets.US_ASCII);
+            String levelName = id.equals("legacy") ? "world" : "world-" + UUID.fromString(id);
+            return new World(levelName, Long.parseLong(new String(seedBytes, StandardCharsets.US_ASCII)));
+        } catch (IllegalArgumentException invalid) {
+            throw new IOException("Invalid Minecraft Overworld ID or seed in Valkey", invalid);
+        }
+    }
+
+    int port() {
+        return address.getPort();
+    }
+
+    record World(String levelName, long seed) {}
+
     long nextAuthorityEpoch() throws IOException {
-        Object reply = execute(text("INCR"), text("minecraft:v1:authority-epoch"));
+        Object reply = execute(text("INCR"), text(AUTHORITY_EPOCH));
         if (reply instanceof Long epoch && epoch > 0) {
             return epoch;
         }
@@ -343,7 +406,7 @@ public final class ValkeyChunkStorage implements ChunkStorage {
                 }
                 case '*' -> {
                     int count = Integer.parseInt(header);
-                    if (!allowArray || count < 0 || count > 2) {
+                    if (!allowArray || count < 0 || count > 3) {
                         throw new IOException("Invalid Valkey array response length");
                     }
                     var values = new ArrayList<>(count);

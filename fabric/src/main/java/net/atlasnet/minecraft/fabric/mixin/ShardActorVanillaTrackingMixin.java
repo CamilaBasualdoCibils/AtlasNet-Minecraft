@@ -17,7 +17,8 @@ abstract class ShardActorVanillaTrackingMixin {
     @Inject(method = "updatePlayer(Lnet/minecraft/server/level/ServerPlayer;)V",
             at = @At("HEAD"), cancellable = true)
     private void atlasnet$trackThroughAtlasNet(ServerPlayer player, CallbackInfo callback) {
-        if (ShardActors.managed(entity)) {
+        if ((entity instanceof ServerPlayer && Boolean.getBoolean("atlasnet.minecraft.shard"))
+                || (ShardActors.managed(entity) && ShardActors.usesAtlasNetVisuals(entity))) {
             callback.cancel();
         }
     }

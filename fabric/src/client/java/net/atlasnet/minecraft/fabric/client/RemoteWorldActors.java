@@ -6,11 +6,15 @@ import java.util.HashMap;
 import java.util.Map;
 import net.atlasnet.minecraft.atlasnet.protocol.signals.WorldActorSignal;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.projectile.Projectile;
+import net.minecraft.world.entity.projectile.ThrowableItemProjectile;
 import net.minecraft.world.item.ItemStack;
 
 final class RemoteWorldActors {
@@ -33,7 +37,7 @@ final class RemoteWorldActors {
             return;
         }
         ItemStack item = null;
-        if (pose.kind() == WorldActorSignal.ITEM) {
+        if (pose.item().length > 0) {
             var tag = NbtIo.readCompressed(new ByteArrayInputStream(pose.item()), NbtAccounter.create(128 * 1024));
             item = ItemStack.parseOptional(level.registryAccess(), tag);
             if (item.isEmpty()) {
@@ -42,10 +46,17 @@ final class RemoteWorldActors {
         }
         Entity entity;
         if (current == null) {
-            entity = item == null ? EntityType.ARROW.create(level)
-                    : new ItemEntity(level, pose.x(), pose.y(), pose.z(), item);
+            entity = switch (pose.kind()) {
+                case WorldActorSignal.ITEM -> new ItemEntity(level, pose.x(), pose.y(), pose.z(), item);
+                case WorldActorSignal.ARROW -> EntityType.ARROW.create(level);
+                case WorldActorSignal.PROJECTILE -> projectile(level, pose.projectileType());
+                default -> null;
+            };
             if (entity == null) {
                 return;
+            }
+            if (entity instanceof ThrowableItemProjectile projectile && item != null) {
+                projectile.setItem(item);
             }
             entity.setNoGravity(true);
             entity.setId(nextId++);
@@ -56,10 +67,22 @@ final class RemoteWorldActors {
             entity = current.entity;
             if (entity instanceof ItemEntity drop && item != null) {
                 drop.setItem(item);
+            } else if (entity instanceof ThrowableItemProjectile projectile && item != null) {
+                projectile.setItem(item);
             }
             entity.lerpTo(pose.x(), pose.y(), pose.z(), pose.yaw(), pose.pitch(), 2);
         }
         visible.put(pose.entity(), new Tracked(entity, pose.revision()));
+    }
+
+    private static Entity projectile(ClientLevel level, String location) {
+        var id = ResourceLocation.tryParse(location);
+        if (id == null) {
+            return null;
+        }
+        var type = BuiltInRegistries.ENTITY_TYPE.getOptional(id).orElse(null);
+        var entity = type == null ? null : type.create(level);
+        return entity instanceof Projectile ? entity : null;
     }
 
     void attach(ClientLevel level) {

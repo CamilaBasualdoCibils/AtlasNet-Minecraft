@@ -5,12 +5,34 @@ import com.mojang.blaze3d.vertex.VertexConsumer;
 import java.util.ArrayList;
 import java.util.List;
 import net.atlasnet.minecraft.atlasnet.protocol.signals.PlayerRegionSignal.Shape;
+import net.minecraft.core.SectionPos;
 
 public final class AtlasNetRegionOutline {
     private static final double RADIUS = 64;
     private static final float HEIGHT = 24;
 
     private AtlasNetRegionOutline() {}
+
+    public static void drawChunkGrid(VertexConsumer vertex, PoseStack.Pose transform,
+                                     double cameraX, double cameraY, double cameraZ) {
+        int chunkSize = SectionPos.SECTION_SIZE;
+        int radius = 2 * chunkSize;
+        double centerX = Math.floor(cameraX / chunkSize) * chunkSize - cameraX;
+        double centerZ = Math.floor(cameraZ / chunkSize) * chunkSize - cameraZ;
+        float height = (float) (Math.floor(cameraY) - cameraY - 1);
+        for (int offset = -radius; offset <= radius + chunkSize; offset += chunkSize) {
+            float x = (float) (centerX + offset);
+            float z = (float) (centerZ + offset);
+            float minX = (float) (centerX - radius);
+            float minZ = (float) (centerZ - radius);
+            float maxX = (float) (centerX + radius + chunkSize);
+            float maxZ = (float) (centerZ + radius + chunkSize);
+            point(vertex, transform, x, height, minZ, 0, 0, 1, 65, 150, 255);
+            point(vertex, transform, x, height, maxZ, 0, 0, 1, 65, 150, 255);
+            point(vertex, transform, minX, height, z, 1, 0, 0, 65, 150, 255);
+            point(vertex, transform, maxX, height, z, 1, 0, 0, 65, 150, 255);
+        }
+    }
 
     public static List<Edge> edges(Shape shape) {
         if (shape == null || shape.dimension() != 2) {
@@ -106,11 +128,18 @@ public final class AtlasNetRegionOutline {
             }
         }
 
-        private static void point(VertexConsumer vertex, PoseStack.Pose transform,
+    }
+
+    private static void point(VertexConsumer vertex, PoseStack.Pose transform,
                                   float x, float y, float z, float nx, float ny, float nz) {
-            vertex.addVertex(transform, x, y, z)
-                    .setColor(100, 240, 255, 255)
-                    .setNormal(transform, nx, ny, nz);
-        }
+        point(vertex, transform, x, y, z, nx, ny, nz, 255, 145, 35);
+    }
+
+    private static void point(VertexConsumer vertex, PoseStack.Pose transform,
+                              float x, float y, float z, float nx, float ny, float nz,
+                              int red, int green, int blue) {
+        vertex.addVertex(transform, x, y, z)
+                .setColor(red, green, blue, 255)
+                .setNormal(transform, nx, ny, nz);
     }
 }

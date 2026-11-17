@@ -2,6 +2,7 @@
 
 #include "AtlasNet/Module/ModuleAPI.hpp"
 #include "FabricServerHost.hpp"
+#include "MinecraftEntityCosts.hpp"
 #include "MinecraftWire.hpp"
 
 #include <bit>
@@ -59,7 +60,7 @@ public:
       AtlasNet::AtlasNetEntityID entity;
       if (found == identities.end())
       {
-        entity = shard.RegisterEntity({.x = x, .y = y, .z = z});
+        entity = shard.RegisterEntity({.x = x, .y = y, .z = z}, MinecraftEntityCosts::ActiveEntity);
         identities.emplace(localId, entity);
         actors.emplace(entity, Actor{localId});
       }
@@ -69,11 +70,15 @@ public:
         continue;
       auto& actor = actors.at(entity);
       const std::array position{x, y, z};
-      if (actor.position != position || actor.pose.empty())
+      if (!actor.position || *actor.position != position)
       {
         actor.position = position;
         shard.UpdateEntityTransform(entity, {.x = x, .y = y, .z = z});
       }
+      // Mobs use Minecraft's vanilla tracker. Their samples still carry an
+      // AtlasNet transform and simulation cost for authority and migration.
+      if (state[MinStateBytes - 1] == 0)
+        continue;
       actor.pose.clear();
       MinecraftWire::AppendBigEndian(actor.pose, entity.value());
       MinecraftWire::AppendBigEndian(actor.pose, ++actor.revision);
@@ -88,12 +93,16 @@ public:
   {
     for (const auto& [entity, actor] : actors)
     {
-      const auto dx = actor.position[0] - x;
-      const auto dy = actor.position[1] - y;
-      const auto dz = actor.position[2] - z;
-      if (!actor.pose.empty() && dx * dx + dy * dy + dz * dz <= radius * radius)
+      if (actor.pose.empty() || !actor.position)
+        continue;
+      const auto& [px, py, pz] = *actor.position;
+      const auto dx = px - x;
+      const auto dy = py - y;
+      const auto dz = pz - z;
+      if (dx * dx + dy * dy + dz * dz <= radius * radius)
       {
         MinecraftWire::AppendBigEndian(result, static_cast<std::uint32_t>(actor.pose.size()));
+        MinecraftWire::AppendBigEndian(result, Show);
         result.insert(result.end(), actor.pose.begin(), actor.pose.end());
       }
     }
@@ -168,7 +177,7 @@ private:
   {
     std::int32_t localId;
     std::uint64_t revision = 0;
-    std::array<double, 3> position{};
+    std::optional<std::array<double, 3>> position;
     std::vector<std::uint8_t> pose;
   };
   std::unordered_map<AtlasNet::AtlasNetEntityID, Actor> actors;

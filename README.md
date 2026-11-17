@@ -82,11 +82,15 @@ Connect use AtlasNet's Client API over SteamNetworkingSockets and display
 connection status. The demo uses the AtlasNet SteamNetSock ingress module and
 has no dependency on the SimpleGame example.
 Configuration and play packets use Minecraft's codecs and travel as ordered
-AtlasNet Signals. Chat uses an AtlasNet Command and broadcast Signal. Join and
+AtlasNet Signals. Terrain batches use a separate stream from gameplay packets.
+AtlasNet ingress monitors session liveness across worker transfers.
+Chat uses an AtlasNet Command and broadcast Signal. Join and
 leave use broadcast Signals, and each player's shard sends its region
 descriptor directly. In the world, use `/atlasnet client showRegion true` or
-`/atlasnet client showRegion false` to toggle the region ID and nearby
-vertical wireframes along the XZ region edges, clipped near the camera.
+`/atlasnet client showRegion false` to toggle the region ID, the blue 16×16
+Minecraft chunk grid, and the orange AtlasNet authority edges. The orange
+edges come from the heuristic's XZ planes and bounds and are clipped near
+the camera.
 The top-left shard UUID is visible by default. Use
 `/atlasnet client metrics false` to hide it or `/atlasnet client metrics true`
 to restore it.
@@ -96,9 +100,10 @@ dimensions. AtlasNet's reserved Overworld ID is `0` in `AtlasNetWorlds`.
 Movement and posture commands use Minecraft's play packet codec. The owning
 shard resolves the player from the AtlasNet command context and invokes the
 normal Minecraft movement listener on the server thread. It publishes accepted
-position changes to AtlasNet and uses Minecraft's existing player tracker for
-same-shard observers. Cross-shard visibility uses SpatialInterest and an
-authoritative pose snapshot, then sends pose changes through Spatial Audience.
+position changes to AtlasNet. Visibility uses SpatialInterest for both local
+and remote observers, with one stable client replica per visible player.
+An authoritative pose snapshot initializes the replica. Spatial Signals then
+carry movement, held items, hand swings, and item-use state.
 In shared terrain mode, one scoped SpatialRPC discovers nearby player poses
 without sending an EntityRPC to each terrain entity in the interest.
 Visibility transitions use the direct recipient API because the current
@@ -107,11 +112,28 @@ AtlasNet Signal router skips `Audience::Entities`.
 Walking beyond AtlasNet's region transfer threshold transfers a live player to
 the new shard. The source freezes the Minecraft player while the destination
 stages the player's compressed Minecraft NBT. The client keeps its Overworld,
-chunk cache, and SteamNetSock connection through the handoff. The region overlay
+chunk cache, and SteamNetSock connection through the handoff. The client retains
+recent movement and replays input after acknowledging the destination's
+checkpoint. The server deduplicates replayed movement and still runs vanilla
+movement validation. Flight and client preferences transfer with the player.
+The region overlay
 and shard UUID update after the destination receives input through AtlasNet's
 committed route. Living, unmounted, awake Overworld players are eligible for this
 handoff. Player statistics and advancements still use each worker's local files.
 Run matching builds of the client and shard module.
+
+The death-screen Respawn button uses Minecraft's normal Overworld spawn rules.
+The shard replaces the dead Minecraft player under the same AtlasNet identity
+and publishes the new position after the client acknowledges the respawn. If
+the spawn belongs to another shard, AtlasNet then transfers the live player
+through the existing connection.
+
+AtlasNet's heuristic workload weights are `1000` for players and `5` for managed
+mobs, projectiles and other active entities. Chunks and other entities have cost
+`0`. The shard passes the chunk and actor weights at
+registration. AtlasNet registers the admitted player itself, so the demo applies
+the player weight once when that client is ready. AtlasNet carries the weights
+through its ownership transfers.
 
 ## Run the AtlasNet local stack
 
@@ -125,6 +147,15 @@ stack tool assigns distinct cluster and handshake ports. Connect one Fabric
 client to each ingress endpoint through Multiplayer. Both endpoints use the
 same Overworld spawn, so separate ingress connections can be assigned to the
 same authoritative shard.
+
+Edit the repository-root `server.properties` and restart the stack to apply
+settings to every shard. `view-distance` caps each client's Render Distance.
+`simulation-distance` controls how far chunks tick around a player.
+The shard copies the shared settings into its local
+runtime files and derives the terrain seed and save folder from Minecraft Valkey.
+To increase the shard count, raise the stack's `desired_count` and provide
+enough worker slots across its nodes. Add ingress endpoints as needed. AtlasNet
+routes gameplay and transfers across the configured shards.
 
 The stack uses `scripts/minecraft-stack-gdb` to debug the AtlasNet nodes and
 detach the Minecraft shard workers at fork. This lets Java handle its own
@@ -193,13 +224,27 @@ The Stack Tool prelaunch prepares a shared terrain session for both workers.
 For a manual launcher, set `ATLASNET_MINECRAFT_VALKEY_TERRAIN=partitioned` in
 the AtlasNet node environment. Use a 2D heuristic with `cluster.spatialPlane`
 set to `XZ`.
-To exercise both owners, give the two ingress groups opposite
-Overworld spawn positions, such as `-16:-60:0` and `16:-60:0`.
+To exercise both owners, give the two ingress groups Overworld spawn positions
+on opposite sides of an AtlasNet boundary. Choose a safe elevation for each
+location in the generated terrain.
 Chunks belong to the shard containing their XZ center, independent of height.
 Nonowners can load read-only replicas for vanilla chunk dependencies. The owner
 sends the initial authoritative chunk and subsequent block changes to remote
-viewers through Spatial Signals. A creative player with an empty hand can
-request an ordinary block break across the border through SpatialRPC.
+viewers through Spatial Signals. Nearby workers apply block deltas to their
+read-only collision replicas, ordered by the chunk's authority epoch and the
+owner's update sequence. Cross-shard block use and mining route through
+a SpatialRPC point at the target chunk center. The player owner validates input
+and reconciles inventory and prediction with the chunk owner's result. When a
+placement crosses a chunk ownership boundary, the clicked owner resolves the
+block interaction first and the placement owner applies the resulting action.
+The chunk owner also handles ordinary block interactions and tool uses,
+including axe stripping and daylight detector toggles. Locally owned block
+menus can open from either face of a chunk boundary. Remote chests and barrels
+use Minecraft's container screen. A remote click is checked against the current
+slots on the chunk owner before changing the container. A conflict refreshes the
+screen. Double chests require both halves to share a terrain owner. Dragging and
+dropping items from remote menus, and remote menus for other block types, are
+currently unsupported.
 
 To enable live chunk migration, give every node the same
 `MINECRAFT_TERRAIN_SESSION` UUID and set AtlasNet's region transfer hysteresis
@@ -213,17 +258,27 @@ regions and KMeans2D's region planes.
 The source freezes the chunk and reserves its saved revision in Valkey. The
 destination installs the checkpoint, including block entities and scheduled
 ticks, before resuming simulation. The transfer does not cover Minecraft's
-separate entity or POI files. Dropped items and arrows use their own AtlasNet
-entity lifecycles and transfer their vanilla entity state separately. Melee
+separate entity or POI files. Dropped items, mobs, and arrows use their own
+AtlasNet entity lifecycles and transfer their vanilla entity state separately. Melee
 against a remote player uses EntityRPC to resolve the hit on that player's
-authoritative shard. Cross-shard block interactions that need inventory or
-block-entity transactions remain unsupported.
+authoritative shard.
 
-The default Overworld uses normal generation with seed `3955`. Both ingress
-endpoints spawn players at `-16:64:0`. The normal terrain store uses port
-`46382` and `run/minecraft-valkey-normal`. The previous superflat terrain uses
-port `46381` and `run/minecraft-valkey`. Set `MINECRAFT_TERRAIN_PRESET=flat`
-explicitly when launching a superflat development world.
+The Stack Tool uses normal Overworld generation. Both shards read the same seed
+and world ID from `minecraft:v1:world:minecraft:overworld` in Minecraft Valkey.
+An empty database receives one randomly generated seed and world ID. Existing
+terrain from the previous default configuration adopts its original seed
+(`3955` for normal terrain, `0` for superflat).
+
+To start a new world, stop the stack, clear Minecraft Valkey DB 0, and run the
+stack again. The new world ID selects a fresh local save folder for each shard.
+The normal terrain store uses port `46382` and `run/minecraft-valkey-normal`.
+AtlasNet cluster data lives in the separate service on port `46380`.
+Both ingress endpoints request `-16:64:0`. If the new terrain obstructs that
+placement, the Minecraft shard raises the player to the surface.
+
+Superflat terrain uses port `46381` and `run/minecraft-valkey`. For a manual superflat launch, set
+`MINECRAFT_TERRAIN_PRESET=flat` for the AtlasNet nodes and the Minecraft Valkey
+startup command.
 
 Run `./gradlew :fabric:chunkStorageTest` against an isolated Minecraft Valkey
 with a fresh data directory. After stopping and starting that test instance,

@@ -21,7 +21,8 @@ abstract class ChunkHolderTerrainMixin {
     @Redirect(method = "broadcastChanges", at = @At(value = "INVOKE",
             target = "Ljava/util/List;isEmpty()Z", ordinal = 1))
     private boolean hasNoBlockViewers(List<ServerPlayer> viewers) {
-        return viewers.isEmpty() && !ShardPlayers.remoteTerrainViewers(((ChunkHolder) (Object) this).getPos());
+        return viewers.isEmpty() && !ShardChunkIO.usesCollisionReplicas()
+                && !ShardPlayers.remoteTerrainViewers(((ChunkHolder) (Object) this).getPos());
     }
 
     @Inject(method = "broadcast", at = @At("HEAD"), cancellable = true)
@@ -31,6 +32,7 @@ abstract class ChunkHolderTerrainMixin {
                 || packet instanceof ClientboundBlockEntityDataPacket)) {
             ChunkPos chunk = ((ChunkHolder) (Object) this).getPos();
             if (ShardChunkIO.ownsTerrain(chunk.toLong())) {
+                ShardPlayers.recordCollisionChanges(chunk, packet);
                 ShardPlayers.sendRemoteTerrain(chunk, packet);
                 for (var viewer : viewers) {
                     ShardPlayers.sendTrackedTerrain(viewer, chunk, packet);

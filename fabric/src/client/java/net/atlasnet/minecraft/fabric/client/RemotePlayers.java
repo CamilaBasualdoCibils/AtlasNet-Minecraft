@@ -8,16 +8,21 @@ import net.atlasnet.minecraft.atlasnet.protocol.signals.PlayerPoseSignal;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.RemotePlayer;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.Pose;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.item.ItemStack;
 
 final class RemotePlayers {
-    private record Tracked(RemotePlayer player, long revision) {}
+    private record Tracked(RemotePlayer player, PlayerPoseSignal pose) {}
     private final Map<Long, Tracked> visible = new HashMap<>();
     private final Map<Integer, Long> entityIds = new HashMap<>();
     private int nextId = -1;
 
     void apply(ClientLevel level, PlayerPoseSignal pose, boolean show) {
         var tracked = visible.get(pose.entity());
+        PlayerPoseSignal previous = tracked == null ? null : tracked.pose();
         if (tracked == null) {
             if (!show) {
                 return;
@@ -29,18 +34,50 @@ final class RemotePlayers {
             player.moveTo(pose.x(), pose.y(), pose.z(), pose.yaw(), pose.pitch());
             level.addEntity(player);
             entityIds.put(player.getId(), pose.entity());
-            tracked = new Tracked(player, pose.revision());
-        } else if (Long.compareUnsigned(pose.revision(), tracked.revision()) <= 0) {
+            tracked = new Tracked(player, pose);
+        } else if (Long.compareUnsigned(pose.revision(), previous.revision()) <= 0) {
             return;
         }
         var player = tracked.player();
         player.lerpTo(pose.x(), pose.y(), pose.z(), pose.yaw(), pose.pitch(), 3);
         player.lerpHeadTo(pose.headYaw(), 3);
         player.setShiftKeyDown(pose.crouching());
-        player.setPose(pose.crouching() ? Pose.CROUCHING : Pose.STANDING);
+        player.setPose(pose.fallFlying() ? Pose.FALL_FLYING : pose.swimming() ? Pose.SWIMMING
+                : pose.crouching() && !pose.flying() ? Pose.CROUCHING : Pose.STANDING);
         player.setSprinting(pose.sprinting());
+        player.setSwimming(pose.swimming());
         player.setOnGround(pose.onGround());
-        visible.put(pose.entity(), new Tracked(player, pose.revision()));
+        if (pose.fallFlying() && !player.isFallFlying()) {
+            player.startFallFlying();
+        } else if (!pose.fallFlying() && player.isFallFlying()) {
+            player.stopFallFlying();
+        }
+        updateItem(player, EquipmentSlot.MAINHAND, pose.mainItem(), previous == null ? -1 : previous.mainItem());
+        updateItem(player, EquipmentSlot.OFFHAND, pose.offItem(), previous == null ? -1 : previous.offItem());
+        updateItem(player, EquipmentSlot.HEAD, pose.headItem(), previous == null ? -1 : previous.headItem());
+        updateItem(player, EquipmentSlot.CHEST, pose.chestItem(), previous == null ? -1 : previous.chestItem());
+        updateItem(player, EquipmentSlot.LEGS, pose.legsItem(), previous == null ? -1 : previous.legsItem());
+        updateItem(player, EquipmentSlot.FEET, pose.feetItem(), previous == null ? -1 : previous.feetItem());
+        if (pose.usingItem()) {
+            var hand = pose.usingOffhand() ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND;
+            if (!player.isUsingItem() || player.getUsedItemHand() != hand) {
+                player.startUsingItem(hand);
+            }
+        } else if (player.isUsingItem()) {
+            player.stopUsingItem();
+        }
+        if (previous != null && pose.mainSwing() != previous.mainSwing()) {
+            player.swing(InteractionHand.MAIN_HAND);
+        } else if (previous != null && pose.offSwing() != previous.offSwing()) {
+            player.swing(InteractionHand.OFF_HAND);
+        }
+        visible.put(pose.entity(), new Tracked(player, pose));
+    }
+
+    private static void updateItem(RemotePlayer player, EquipmentSlot slot, int item, int previous) {
+        if (item != previous) {
+            player.setItemSlot(slot, new ItemStack(BuiltInRegistries.ITEM.byId(item)));
+        }
     }
 
     void remove(ClientLevel level, long id) {

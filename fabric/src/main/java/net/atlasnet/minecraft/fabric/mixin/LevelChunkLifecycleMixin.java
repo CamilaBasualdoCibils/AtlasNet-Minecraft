@@ -1,5 +1,6 @@
 package net.atlasnet.minecraft.fabric.mixin;
 
+import net.atlasnet.minecraft.fabric.server.ShardPlayers;
 import net.atlasnet.minecraft.fabric.server.storage.ShardChunkIO;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
@@ -16,7 +17,9 @@ abstract class LevelChunkLifecycleMixin {
     private void recordChunkState(boolean loaded, CallbackInfo callback) {
         var io = ShardChunkIO.current();
         if (io != null && loaded) {
-            io.recordLifecycle((LevelChunk) (Object) this, true);
+            var chunk = (LevelChunk) (Object) this;
+            io.recordLifecycle(chunk, true);
+            ShardPlayers.collisionReplicaLoaded(chunk);
         }
     }
 

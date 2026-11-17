@@ -1,5 +1,6 @@
 package net.atlasnet.minecraft.fabric.mixin;
 
+import net.atlasnet.minecraft.fabric.server.ShardPlayers;
 import net.atlasnet.minecraft.fabric.server.storage.ShardChunkIO;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -15,6 +16,7 @@ abstract class ServerLevelChunkUnloadMixin {
         var io = ShardChunkIO.current();
         if (io != null) {
             io.recordLifecycle(chunk, false);
+            ShardPlayers.collisionReplicaUnloaded(chunk.getPos());
         }
     }
 }
