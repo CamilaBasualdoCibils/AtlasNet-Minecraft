@@ -1,19 +1,19 @@
 {
   "schemaVersion": 1,
-  "id": "atlasnet",
+  "id": "atlasnet_minecraft",
   "version": "${version}",
   "name": "AtlasNet Minecraft Demo",
   "description": "Experimental Minecraft integration demo for AtlasNet.",
   "environment": "*",
+  "mixins": ["atlasnet_minecraft.mixins.json"],
   "entrypoints": {
-    "main": ["net.atlasnet.minecraft.fabric.AtlasNetFabric"],
-    "server": ["net.atlasnet.minecraft.fabric.AtlasNetFabricServer"],
-    "client": ["net.atlasnet.minecraft.fabric.client.AtlasNetFabricClient"]
+    "main": ["net.atlasnet.minecraft.fabric.FabricDemo"],
+    "server": ["net.atlasnet.minecraft.fabric.FabricDedicatedServer"],
+    "client": ["net.atlasnet.minecraft.fabric.FabricClient"]
   },
   "depends": {
     "fabricloader": ">=${loader_version}",
     "minecraft": "${minecraft_version}",
-    "java": ">=21",
-    "fabric-api": ">=${fabric_api_version}"
+    "java": ">=21"
   }
 }

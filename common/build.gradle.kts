@@ -18,3 +18,18 @@ dependencies {
 // It is not an independently installable mod.
 tasks.named("remapJar") { enabled = false }
 tasks.named("remapSourcesJar") { enabled = false }
+
+val protocolTestSources = sourceSets.create("protocolTest") {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+
+val protocolTest by tasks.registering(JavaExec::class) {
+    group = "verification"
+    description = "Checks AtlasNet application payloads using the shared codecs."
+    dependsOn(protocolTestSources.classesTaskName)
+    classpath = protocolTestSources.runtimeClasspath
+    mainClass.set("net.atlasnet.minecraft.atlasnet.protocol.ProtocolRegistryTest")
+}
+
+tasks.check { dependsOn(protocolTest) }

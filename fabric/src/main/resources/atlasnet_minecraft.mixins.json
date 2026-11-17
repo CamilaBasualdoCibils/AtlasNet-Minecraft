@@ -1,0 +1,8 @@
+{
+  "required": true,
+  "package": "net.atlasnet.minecraft.fabric.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "server": ["DedicatedServerMixin", "ShardWorldsMixin", "ChunkStorageMixin", "LevelChunkLifecycleMixin", "ServerLevelChunkUnloadMixin", "ChunkHolderTerrainMixin", "ServerConnectionAccessor", "ServerTerrainTickerMixin", "NaturalSpawnerAuthorityMixin", "ServerTerrainMutationMixin", "PlayerTransferDataMixin", "ChunkTransferAccessor", "ShardActorTrackingMixin", "ShardActorTickMixin", "ShardActorPickupMixin", "ShardActorVanillaTrackingMixin", "ShardArrowCollisionAccessor", "ShardProjectileOwnerMixin", "ShardItemTransferMixin"],
+  "client": ["ConnectScreenMixin", "ServerStatusPingerMixin", "ClientChatMixin", "RegionHudMixin", "RegionOutlineMixin", "EntityRemovalAccessor", "InteractPacketAccessor"],
+  "injectors": {"defaultRequire": 1}
+}

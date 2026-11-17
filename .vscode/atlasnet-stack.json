@@ -1,0 +1,102 @@
+{
+  "program": "${workspaceFolder}/../AtlasNet/build/AtlasNetNode",
+  "cwd": "${workspaceFolder}/build",
+  "preLaunchCommand": "cmake -S \"${workspaceFolder}\" -B \"${workspaceFolder}/build\" -DATLASNET_MINECRAFT_SHARD_MODULE=ON && cmake --build \"${workspaceFolder}/build\" --target BuildServer && python3 \"${workspaceFolder}/scripts/minecraft-valkey.py\" start --stack-session",
+  "gdb": "${workspaceFolder}/scripts/minecraft-stack-gdb",
+  "clusterPort": 42000,
+  "handshakePort": 43000,
+  "ignoreShutdownSignals": true,
+  "valgrind": false,
+  "valgrindProgram": "/usr/bin/valgrind",
+  "perf": false,
+  "perfProgram": "/usr/bin/perf",
+  "perfOutput": "${workspaceFolder}/build/perf-${index}.data",
+  "valkeyURI": "tcp://127.0.0.1:46380",
+  "launchValkey": true,
+  "valkeyProgram": "${workspaceFolder}/../AtlasNet/build/_deps/valkey-src/src/valkey-server",
+  "initializeCluster": true,
+  "clusterMode": "direct",
+  "clusterConfigPath": "",
+  "clusterSettings": {
+    "spatialPlane": "XZ",
+    "controller": {
+      "heuristic": "KMeans2D",
+      "autoscale": {
+        "enabled": false
+      },
+      "spatial": {
+        "recompute_interval": "60000ms"
+      },
+      "shards": {
+        "desired_count": 2
+      }
+    },
+    "region_transfer": {
+      "hysteresis_distance": 0
+    }
+  },
+  "groups": [
+    {
+      "name": "Minecraft ingress A",
+      "count": 1,
+      "capabilities": [
+        "Database",
+        "Shard",
+        "ControllerEligible",
+        "ClientIngress"
+      ],
+      "args": [],
+      "nodeMode": "direct",
+      "nodeConfigPath": "",
+      "nodeSettings": {
+        "shards": {
+          "max_count": 1,
+          "worker_executable": "${workspaceFolder}/../AtlasNet/build/AtlasNetShardWorker"
+        },
+        "modules": [
+          "${workspaceFolder}/build/native/AtlasNetMinecraftShard.so",
+          "${workspaceFolder}/../AtlasNet/build/AtlasNetSteamNetSock.so"
+        ],
+        "ingress": [
+          {
+            "transport": "SteamNetSock",
+            "port": 5919,
+            "admission": "AllowAll",
+            "spawn": "Static(minecraft:overworld,-16:-60:0)"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Minecraft ingress B",
+      "count": 1,
+      "capabilities": [
+        "Database",
+        "Shard",
+        "ControllerEligible",
+        "ClientIngress"
+      ],
+      "args": [],
+      "nodeMode": "direct",
+      "nodeConfigPath": "",
+      "nodeSettings": {
+        "shards": {
+          "max_count": 1,
+          "worker_executable": "${workspaceFolder}/../AtlasNet/build/AtlasNetShardWorker"
+        },
+        "modules": [
+          "${workspaceFolder}/build/native/AtlasNetMinecraftShard.so",
+          "${workspaceFolder}/../AtlasNet/build/AtlasNetSteamNetSock.so"
+        ],
+        "ingress": [
+          {
+            "transport": "SteamNetSock",
+            "port": 5920,
+            "admission": "AllowAll",
+            "spawn": "Static(minecraft:overworld,-16:-60:0)"
+          }
+        ]
+      }
+    }
+  ]
+}

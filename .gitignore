@@ -8,3 +8,11 @@
 .classpath
 .project
 .settings/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.log
+
+/.vscode/atlasnet-generated/
+/.build/stacklogs/

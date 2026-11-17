@@ -1,0 +1,14 @@
+#!/bin/sh
+script_directory=$(dirname -- "$0")
+export MINECRAFT_TERRAIN_PRESET="${MINECRAFT_TERRAIN_PRESET:-normal}"
+if [ "$MINECRAFT_TERRAIN_PRESET" = normal ]; then
+    export MINECRAFT_VALKEY_PORT="${MINECRAFT_VALKEY_PORT:-46382}"
+    export MINECRAFT_VALKEY_DIR="${MINECRAFT_VALKEY_DIR:-$script_directory/../run/minecraft-valkey-normal}"
+fi
+session_file="$script_directory/../build/minecraft-terrain-session"
+if [ -z "${ATLASNET_MINECRAFT_VALKEY_TERRAIN+x}" ] && [ -r "$session_file" ]; then
+    IFS= read -r MINECRAFT_TERRAIN_SESSION < "$session_file"
+    export MINECRAFT_TERRAIN_SESSION
+    export ATLASNET_MINECRAFT_VALKEY_TERRAIN=partitioned
+fi
+exec /usr/bin/gdb -ix "$script_directory/minecraft-stack.gdb" "$@"
