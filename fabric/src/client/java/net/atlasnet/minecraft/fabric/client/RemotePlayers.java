@@ -15,7 +15,65 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.ItemStack;
 
 final class RemotePlayers {
-    private record Tracked(RemotePlayer player, PlayerPoseSignal pose) {}
+    /** Rendering prediction only; authority and gameplay remain on the shard. */
+    private static final class Replica extends RemotePlayer {
+        private int snapshotAge;
+        private float motionX;
+        private float motionY;
+        private float motionZ;
+        private long motionSequence;
+        private boolean predictedMotion;
+
+        Replica(ClientLevel level, GameProfile profile) {
+            super(level, profile);
+        }
+
+        void snapshot(PlayerPoseSignal pose) {
+            long elapsed = pose.motionSequence() - motionSequence;
+            boolean continuing = motionX * pose.motionX() + motionY * pose.motionY()
+                    + motionZ * pose.motionZ() > 0;
+            // A late source pose can arrive after we have visually predicted
+            // past it. Age it by the existing client movement sequence instead
+            // of restarting interpolation at its older checkpoint.
+            snapshotAge = predictedMotion && continuing && elapsed >= 0 && elapsed < snapshotAge
+                    ? snapshotAge - (int) elapsed : 0;
+            motionSequence = pose.motionSequence();
+            motionX = pose.motionX();
+            motionY = pose.motionY();
+            motionZ = pose.motionZ();
+            double dx = pose.x() - getX();
+            double dy = pose.y() - getY();
+            double dz = pose.z() - getZ();
+            double speedSquared = motionX * motionX + motionY * motionY + motionZ * motionZ;
+            if (predictedMotion && continuing && elapsed >= 0
+                    && dx * dx + dy * dy + dz * dz <= 49 * speedSquared
+                    && dx * motionX + dy * motionY + dz * motionZ < 2 * speedSquared) {
+                // Several late samples can arrive in one client tick. Keep
+                // the rendered trajectory until authority catches up, within
+                // the same seven-tick prediction bound, without rewinding it.
+                snapshotAge = Math.max(3, snapshotAge);
+                lerpTo(getX(), getY(), getZ(), pose.yaw(), pose.pitch(), 1);
+                return;
+            }
+            predictedMotion = false;
+            int lead = Math.clamp(snapshotAge - 3, 0, 7);
+            lerpTo(pose.x() + motionX * lead, pose.y() + motionY * lead, pose.z() + motionZ * lead,
+                    pose.yaw(), pose.pitch(), lead > 0 ? 1 : 3);
+        }
+
+        @Override
+        public void tick() {
+            super.tick();
+            // Vanilla interpolates the first three ticks. Bridge short frozen
+            // authority gaps using the last server-measured velocity, bounded
+            // to half a second overall; never extrapolate indefinitely.
+            if (++snapshotAge > 3 && snapshotAge <= 10) {
+                setPos(getX() + motionX, getY() + motionY, getZ() + motionZ);
+                predictedMotion = true;
+            }
+        }
+    }
+    private record Tracked(Replica player, PlayerPoseSignal pose) {}
     private final Map<Long, Tracked> visible = new HashMap<>();
     private final Map<Integer, Long> entityIds = new HashMap<>();
     private int nextId = -1;
@@ -29,7 +87,7 @@ final class RemotePlayers {
             }
             String name = String.format("AN%014x", pose.client() & 0x00ffffffffffffffL);
             var profile = new GameProfile(new UUID(0x41544c41534e4554L, pose.client()), name);
-            var player = new RemotePlayer(level, profile);
+            var player = new Replica(level, profile);
             player.setId(nextId--);
             player.moveTo(pose.x(), pose.y(), pose.z(), pose.yaw(), pose.pitch());
             level.addEntity(player);
@@ -39,7 +97,7 @@ final class RemotePlayers {
             return;
         }
         var player = tracked.player();
-        player.lerpTo(pose.x(), pose.y(), pose.z(), pose.yaw(), pose.pitch(), 3);
+        player.snapshot(pose);
         player.lerpHeadTo(pose.headYaw(), 3);
         player.setShiftKeyDown(pose.crouching());
         player.setPose(pose.fallFlying() ? Pose.FALL_FLYING : pose.swimming() ? Pose.SWIMMING

@@ -270,7 +270,8 @@ public final class AtlasNetPlayConnection extends Connection {
         if (id == 0x4d43010d && payload.length == Long.BYTES) {
             playEpoch = ByteBuffer.wrap(payload).getLong();
             awaitingHandoffLogin = true;
-            terrainSnapshots.clear();
+            // Owner snapshots are keyed by the stable AtlasNet viewer and
+            // source transfer ID, independently of the player's play epoch.
         } else if (id == TerrainSnapshotSignal.VIEWER_ID && payload.length == Long.BYTES) {
             terrainSnapshots.setViewer(ByteBuffer.wrap(payload).getLong());
         } else if (id == TerrainSnapshotSignal.ID) {

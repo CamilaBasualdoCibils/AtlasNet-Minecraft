@@ -104,6 +104,12 @@ position changes to AtlasNet. Visibility uses SpatialInterest for both local
 and remote observers, with one stable client replica per visible player.
 An authoritative pose snapshot initializes the replica. Spatial Signals then
 carry movement, held items, hand swings, and item-use state.
+Pose updates include measured motion and the existing client movement sequence.
+They use immediate sequenced Signals on stream 3, with a reliable confirmation
+when a pose settles. Remote players retain vanilla interpolation and bridge
+short authority gaps with bounded visual prediction. Late source poses retain
+their sample age, so they do not rewind a player that has already been drawn
+past that checkpoint. Remote replicas do not simulate authoritative gameplay.
 In shared terrain mode, one scoped SpatialRPC discovers nearby player poses
 without sending an EntityRPC to each terrain entity in the interest.
 Visibility transitions use the direct recipient API because the current
@@ -116,6 +122,11 @@ chunk cache, and SteamNetSock connection through the handoff. The client retains
 recent movement and replays input after acknowledging the destination's
 checkpoint. The server deduplicates replayed movement and still runs vanilla
 movement validation. Flight and client preferences transfer with the player.
+The destination reuses the client's recipes and command tree. Terrain demand
+changes viewer roles without forcing a full chunk refresh, and owner snapshot
+fragments remain valid across play epochs. The source retains acknowledged
+chunk deliveries; any unacknowledged local chunks can still be sent by their
+owner after handoff.
 The region overlay
 and shard UUID update after the destination receives input through AtlasNet's
 committed route. Living, unmounted, awake Overworld players are eligible for this
@@ -139,23 +150,28 @@ through its ownership transfers.
 
 Open this repository as a single folder in VS Code and run **AtlasNet: Open
 Local Stack**, then **Run stack**. The [stack configuration](.vscode/atlasnet-stack.json)
-starts two AtlasNet nodes with one shard each and a KMeans2D target of two
-regions on AtlasNet's XZ spatial plane. Both nodes use the Database, Shard,
+starts two AtlasNet nodes with one shard each and the module-registered
+`example.xsplit2d` heuristic on AtlasNet's XZ spatial plane. It loads AtlasNet's
+`Examples/Heuristics/XAxisSplit` module on both nodes. The boundary stays at
+`x = 0`, with one unbounded region on each side. Both nodes use the Database, Shard,
 ControllerEligible, and ClientIngress capabilities, the same Minecraft settings, and a shared AtlasNet
 Valkey process. Their SteamNetSock ingress ports are `5919` and `5920`. The
 stack tool assigns distinct cluster and handshake ports. Connect one Fabric
-client to each ingress endpoint through Multiplayer. Both endpoints use the
-same Overworld spawn, so separate ingress connections can be assigned to the
-same authoritative shard.
+client to each ingress endpoint through Multiplayer. Endpoint A spawns at
+`(-12, -60, 0)` and B at `(12, -60, 6)` in superflat terrain. Walk across `x = 0`
+and verify the shard UUID changes in the metrics overlay. Crossing a drawn
+boundary alone does not prove an authority transfer. Transfers use AtlasNet's
+batched coordinator with a 50 ms batch interval and zero hysteresis.
 
 Edit the repository-root `server.properties` and restart the stack to apply
 settings to every shard. `view-distance` caps each client's Render Distance.
 `simulation-distance` controls how far chunks tick around a player.
 The shard copies the shared settings into its local
 runtime files and derives the terrain seed and save folder from Minecraft Valkey.
-To increase the shard count, raise the stack's `desired_count` and provide
-enough worker slots across its nodes. Add ingress endpoints as needed. AtlasNet
-routes gameplay and transfers across the configured shards.
+The X-axis example intentionally always produces two regions. To test more
+shards, select a scalable registered heuristic such as `atlasnet.kmeans2d`,
+raise `desired_count`, and provide enough worker slots across its nodes.
+Minecraft routing itself does not depend on there being two shards.
 
 The stack uses `scripts/minecraft-stack-gdb` to debug the AtlasNet nodes and
 detach the Minecraft shard workers at fork. This lets Java handle its own
@@ -172,7 +188,8 @@ cmake --build build --target BuildServer
 ```
 
 The stack panel runs `BuildServer` before launch. That target builds
-`build/native/AtlasNetMinecraftShard.so` and the Fabric artifact. The panel
+`build/native/AtlasNetMinecraftShard.so`, `build/native/xsplit/AtlasNetXAxisSplit.so`,
+and the Fabric artifact. The panel
 launches the prebuilt AtlasNet node and Valkey using the saved configuration.
 Provision the node, worker, SteamNetSock module, and Valkey before launching.
 The Minecraft build reads the AtlasNet SDK without rebuilding it.
@@ -188,13 +205,13 @@ executable and module paths in the stack configuration to match.
 
 The native plugin launches Fabric inside each shard worker JVM. Use the
 local development EULA setup above before starting the stack. Minecraft's
-working files live under `fabric/run/server/valkey-normal-shards/<shard-id>` and the
-workers share the normal Overworld's chunk data through Minecraft Valkey.
+working files live under `fabric/run/server/valkey-shards/<shard-id>` and the
+workers share the Overworld's chunk data through Minecraft Valkey.
 
 
 The stack prelaunch also starts Minecraft's dedicated Valkey at
-`redis://127.0.0.1:46382/0` with append-only persistence in
-`run/minecraft-valkey-normal`. Connection browsers need a separate entry for this
+`redis://127.0.0.1:46381/0` with append-only persistence in
+`run/minecraft-valkey`. Connection browsers need a separate entry for this
 instance. The stack panel manages AtlasNet's Valkey on port `46380`. After
 stopping the stack, run `python3 scripts/minecraft-valkey.py stop` to save and
 stop the Minecraft instance.
@@ -263,7 +280,7 @@ AtlasNet entity lifecycles and transfer their vanilla entity state separately. M
 against a remote player uses EntityRPC to resolve the hit on that player's
 authoritative shard.
 
-The Stack Tool uses normal Overworld generation. Both shards read the same seed
+The Stack Tool currently uses superflat for repeatable boundary tests. Both shards read the same seed
 and world ID from `minecraft:v1:world:minecraft:overworld` in Minecraft Valkey.
 An empty database receives one randomly generated seed and world ID. Existing
 terrain from the previous default configuration adopts its original seed
@@ -273,12 +290,46 @@ To start a new world, stop the stack, clear Minecraft Valkey DB 0, and run the
 stack again. The new world ID selects a fresh local save folder for each shard.
 The normal terrain store uses port `46382` and `run/minecraft-valkey-normal`.
 AtlasNet cluster data lives in the separate service on port `46380`.
-Both ingress endpoints request `-16:64:0`. If the new terrain obstructs that
-placement, the Minecraft shard raises the player to the surface.
+If terrain obstructs the configured placement, the Minecraft shard raises the
+player to the surface.
 
-Superflat terrain uses port `46381` and `run/minecraft-valkey`. For a manual superflat launch, set
-`MINECRAFT_TERRAIN_PRESET=flat` for the AtlasNet nodes and the Minecraft Valkey
-startup command.
+Superflat terrain uses port `46381` and `run/minecraft-valkey`. To return to
+normal terrain, set `MINECRAFT_TERRAIN_PRESET=normal` for the AtlasNet nodes and
+the Minecraft Valkey startup command in the stack's `preLaunchCommand`.
+The launcher defaults to flat but respects that environment override.
+
+The repeatable migration test builds the demo and uses the real Stack Tool
+configuration generator, two shard workers, and two graphical Fabric clients:
+
+```sh
+python3 tests/integration/migration.py --seconds 90 --label walking
+```
+
+Run it from the repository root in a graphical session with JDK 21 and the
+AtlasNet SDK already built. It uses isolated Valkey data and ingress ports
+`5971` and `5972`. The first client walks between x=-32 and x=32 while the
+second watches. It records shard UUID changes, position corrections, observer
+continuity, loading screens, client tick gaps, and slow server ticks under
+`build/migration-test/walking/`. `MIGRATION_BATCH=400ms` repeats the test with
+delayed transfer batches. The optional `-PatlasnetMigrationTest` mod supplies
+real key input and measurement hooks; it is excluded from normal builds. The
+runner restores the normal shard launch configuration when it finishes.
+Screenshots in each client's `screenshots/` folder capture the first confirmed
+handoff; the observer also enables the region boundary overlay.
+
+Validated locally on 2026-11-17 with two actual Fabric clients connected to
+separate SteamNetSock ingress sockets and walking repeatedly between x=-32
+and x=32 in superflat. Both 90-second runs passed: `final-walking` used the
+saved 50 ms transfer batch, and `final-batched` used 400 ms. Each recorded six
+actual shard UUID changes, zero position corrections, zero backward steps in
+either view, zero missing/recreated remote players, zero boundary stalls, and
+zero loading screens or world replacements. Neither server logged a tick over
+100 ms or a tick gap over 150 ms during measurement. Client tick gaps peaked
+below 66 ms. Reports and screenshots are under `build/migration-test/`.
+The shared protocol codec checks and Fabric checks also passed.
+An additional 35-second, 400 ms batch run (`final-recovery`) completed three
+migrations and verified reliable resting-pose recovery after deliberately
+omitting updates on the observer. Repeat that check with `--verify-settled`.
 
 Run `./gradlew :fabric:chunkStorageTest` against an isolated Minecraft Valkey
 with a fresh data directory. After stopping and starting that test instance,

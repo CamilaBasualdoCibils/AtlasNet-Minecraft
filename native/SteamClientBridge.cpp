@@ -173,7 +173,10 @@ Java_net_atlasnet_minecraft_fabric_client_AtlasNetConnection_sendCommand(
     env->GetByteArrayRegion(payload, 0, static_cast<jsize>(bytes.size()),
                             reinterpret_cast<jbyte*>(bytes.data()));
     if (!env->ExceptionCheck())
-      reinterpret_cast<Session*>(handle)->client.DispatchRawCommand(static_cast<std::uint32_t>(id), bytes);
+      // Input and teleport acknowledgements must not wait behind a gameplay
+      // batch during handoff. Retain their shared reliable ordered stream.
+      reinterpret_cast<Session*>(handle)->client.DispatchRawCommand(static_cast<std::uint32_t>(id), bytes,
+          {.batching = AtlasNet::Module::GameplayBatching::Immediate});
   }
   catch (const std::exception& error)
   {

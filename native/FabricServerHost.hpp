@@ -417,7 +417,7 @@ public:
     return range;
   }
 
-  std::optional<std::array<double, 15>> TakePose(jlong entityId)
+  std::optional<std::array<double, 19>> TakePose(jlong entityId)
   {
     auto bridge = PlayerBridge();
     auto method = env->GetStaticMethodID(bridge, "takePose", "(J)[D");
@@ -426,7 +426,7 @@ public:
     CheckJava();
     if (!data)
       return std::nullopt;
-    std::array<double, 15> pose;
+    std::array<double, 19> pose;
     env->GetDoubleArrayRegion(data, 0, pose.size(), pose.data());
     env->DeleteLocalRef(data);
     CheckJava();

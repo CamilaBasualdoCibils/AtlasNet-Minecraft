@@ -2,6 +2,7 @@ package net.atlasnet.minecraft.fabric.server;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.server.level.ChunkTrackingView;
 import net.minecraft.server.level.ServerChunkCache;
@@ -20,7 +21,12 @@ final class ChunkDemandManager {
 
     private final Map<Long, Demand> observers = new HashMap<>();
     private final Map<ChunkPos, Map<Long, Integer>> remoteViewers = new HashMap<>();
+    private final Map<Long, Set<ChunkPos>> retainedChunks = new HashMap<>();
     private final ChunkTerrainSnapshots snapshots = new ChunkTerrainSnapshots();
+
+    void retainClientChunks(long observer, Set<ChunkPos> acknowledged) {
+        retainedChunks.put(observer, acknowledged);
+    }
 
     void apply(DedicatedServer server, long observer, long revision, int x, int z,
                int viewDistance, int simulationDistance, boolean[] ownership, boolean remote, boolean refresh) {
@@ -77,10 +83,15 @@ final class ChunkDemandManager {
             }
         }
         if (remote) {
+            var retained = retainedChunks.remove(observer);
             for (var pos : tickets.keySet()) {
                 if (tracking.contains(pos)) {
                     remoteViewers.computeIfAbsent(pos, key -> new HashMap<>()).put(observer, viewDistance);
-                    if (refresh || previous == null || !previous.remote() || !previous.canSee(pos)) {
+                    // Local/remote viewer role changes preserve the same
+                    // ingress session and client chunk cache across handoff.
+                    boolean undeliveredLocal = previous != null && !previous.remote()
+                            && (retained == null || !retained.contains(pos));
+                    if (refresh || previous == null || !previous.canSee(pos) || undeliveredLocal) {
                         int distance = Math.max(Math.abs(x - pos.x), Math.abs(z - pos.z));
                         snapshots.capture(pos, observer, viewDistance, distance, () -> {
                             var latest = observers.get(observer);

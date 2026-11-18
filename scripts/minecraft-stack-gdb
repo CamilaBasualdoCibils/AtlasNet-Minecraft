@@ -1,7 +1,11 @@
 #!/bin/sh
 script_directory=$(dirname -- "$0")
-export MINECRAFT_TERRAIN_PRESET=normal
-export MINECRAFT_VALKEY_PORT="${MINECRAFT_VALKEY_PORT:-46382}"
+export MINECRAFT_TERRAIN_PRESET="${MINECRAFT_TERRAIN_PRESET:-normal}"
+if [ "$MINECRAFT_TERRAIN_PRESET" = flat ]; then
+    export MINECRAFT_VALKEY_PORT="${MINECRAFT_VALKEY_PORT:-46381}"
+else
+    export MINECRAFT_VALKEY_PORT="${MINECRAFT_VALKEY_PORT:-46382}"
+fi
 session_file="$script_directory/../build/minecraft-terrain-session"
 if [ -z "${ATLASNET_MINECRAFT_VALKEY_TERRAIN+x}" ] && [ -r "$session_file" ]; then
     IFS= read -r MINECRAFT_TERRAIN_SESSION < "$session_file"

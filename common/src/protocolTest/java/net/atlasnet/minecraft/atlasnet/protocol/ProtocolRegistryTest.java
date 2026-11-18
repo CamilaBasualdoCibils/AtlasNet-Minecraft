@@ -57,22 +57,28 @@ public final class ProtocolRegistryTest {
     }
 
     private static void playerPose() throws IOException {
-        var frame = ByteBuffer.allocate(93)
+        var frame = ByteBuffer.allocate(113)
                 .putLong(7).putLong(8).putLong(9)
                 .putDouble(120.75).putDouble(180).putDouble(-35.25)
                 .putFloat(130).putFloat(-12).putFloat(125)
                 .put((byte) (8 | 16 | 32))
                 .putInt(40).putInt(20).putInt(300).putInt(301)
-                .putInt(302).putInt(303).putInt(304).putInt(305).array();
+                .putInt(302).putInt(303).putInt(304).putInt(305)
+                .putFloat(.215f).putFloat(-.1f).putFloat(0).putLong(86).array();
         var pose = PlayerPoseSignal.decode(frame);
         if (pose.entity() != 7 || pose.revision() != 9 || pose.x() != 120.75 || pose.headYaw() != 125
                 || !pose.flying() || !pose.usingItem() || !pose.usingOffhand() || pose.onGround()
                 || pose.mainSwing() != 40 || pose.offSwing() != 20 || pose.mainItem() != 300 || pose.offItem() != 301
                 || pose.headItem() != 302 || pose.chestItem() != 303 || pose.legsItem() != 304
-                || pose.feetItem() != 305) {
+                || pose.feetItem() != 305 || pose.motionX() != .215f || pose.motionY() != -.1f
+                || pose.motionZ() != 0 || pose.motionSequence() != 86) {
             throw new AssertionError("Player pose and action fields must match the native wire layout");
         }
         expectBadPayload(() -> PlayerPoseSignal.decode(Arrays.copyOf(frame, frame.length - 1)));
+        ByteBuffer.wrap(frame).putFloat(93, Float.NaN);
+        expectBadPayload(() -> PlayerPoseSignal.decode(frame));
+        ByteBuffer.wrap(frame).putFloat(93, .215f).putLong(105, -1);
+        expectBadPayload(() -> PlayerPoseSignal.decode(frame));
     }
 
     private static void worldActor() {

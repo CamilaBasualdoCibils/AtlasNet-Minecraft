@@ -97,3 +97,16 @@ tasks.register<JavaExec>("chunkStorageTest") {
     classpath = chunkStorageTestSources.runtimeClasspath
     mainClass.set("net.atlasnet.minecraft.fabric.server.storage.ValkeyChunkStorageTest")
 }
+
+if (providers.gradleProperty("atlasnetMigrationTest").isPresent) {
+    val migrationTest = sourceSets.create("migrationTest") {
+        compileClasspath += sourceSets.main.get().output + sourceSets["client"].output +
+            sourceSets["client"].compileClasspath
+        runtimeClasspath += sourceSets["client"].runtimeClasspath
+    }
+    loom.mods.create("atlasnet_migration_test") { sourceSet(migrationTest) }
+    tasks.named<JavaExec>("runServer") { classpath += migrationTest.output }
+    tasks.named<JavaExec>("runClient") { classpath += migrationTest.output }
+    tasks.named("prepareShardServer") { dependsOn(migrationTest.classesTaskName) }
+    tasks.named("runClient") { dependsOn(migrationTest.classesTaskName) }
+}

@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "atlasnet_migration_test",
+  "version": "1",
+  "name": "AtlasNet migration integration test",
+  "environment": "*",
+  "mixins": ["atlasnet_migration_test.mixins.json"]
+}

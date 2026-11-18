@@ -33,7 +33,7 @@ constexpr std::size_t MaxGameplayInputBytes = 16 * 1024;
 constexpr std::size_t TerrainUpdateHeaderBytes = 3 * sizeof(std::int32_t);
 constexpr std::size_t SnapshotQueueHeaderBytes = sizeof(std::uint64_t) + 3 * sizeof(std::int32_t);
 constexpr std::size_t SnapshotWireHeaderBytes = 4 * sizeof(std::uint64_t) + 4 * sizeof(std::int32_t);
-constexpr std::size_t PoseBytes = 6 * sizeof(std::uint64_t) + 11 * sizeof(std::uint32_t) + 1;
+constexpr std::size_t PoseBytes = 7 * sizeof(std::uint64_t) + 14 * sizeof(std::uint32_t) + 1;
 constexpr AtlasNet::CmdSig::SignalID PlayerPoseShow = 0x4d430107;
 constexpr std::size_t TransferHeaderBytes = 4 * sizeof(std::uint64_t) + 16 + 5 * sizeof(std::uint32_t);
 constexpr std::size_t MaxPlayerTransferBytes = 48 * 1024;
@@ -156,6 +156,11 @@ public:
       auto& player = players.emplace(entity, std::move(incoming->second)).first->second;
       stagedPlayers.erase(incoming);
       CapturePose(entity, player);
+      // The restored checkpoint is older than the client's continuing motion.
+      // Retain it for initial visibility, but publish movement only when the
+      // destination simulation has consumed fresh/replayed input.
+      player.poseDirty = false;
+      player.poseNeedsConfirmation = false;
       ObservePlayers(entity, player);
       return true;
     };
@@ -709,13 +714,15 @@ private:
     std::array<double, 3> position{};
     std::optional<std::array<double, 3>> publishedPosition;
     bool poseDirty = false;
+    bool poseNeedsConfirmation = false;
+    std::chrono::steady_clock::time_point poseConfirmAt;
     std::uint64_t revision = 0;
     std::optional<MinecraftTerrain::Window> demand;
     std::uint64_t demandRevision = 0;
     using PoseQuery = AtlasNet::SpatialRPCResult<std::vector<std::uint8_t>>;
     std::optional<std::future<PoseQuery>> terrainPoses;
     bool terrainPosesDirty = false;
-    bool resetDemand = false;
+    bool republishDemand = false;
   };
 
   bool PreparePlayerTransfer(AtlasNet::AtlasNetEntityID entity, AtlasNet::EntityPayload& payload)
@@ -768,7 +775,7 @@ private:
     if (const auto view = coordinate(56); view != 0)
       player.demand = MinecraftTerrain::Window{coordinate(48), coordinate(52), view, coordinate(60)};
     player.trackingRange = server.TrackingRange();
-    player.resetDemand = true;
+    player.republishDemand = true;
     const auto count = ReadBigEndian<std::uint32_t>(payload.subspan(64));
     auto state = payload.subspan(TransferHeaderBytes);
     if (count > state.size() / sizeof(std::uint64_t))
@@ -894,10 +901,10 @@ private:
       next = MinecraftTerrain::Window{(*pending)[0], (*pending)[1], (*pending)[2], (*pending)[3]};
     if (next)
     {
-      const bool refresh = std::exchange(player.resetDemand, false);
-      if (next != player.demand || regionChanged || refresh)
+      const bool republish = std::exchange(player.republishDemand, false);
+      if (next != player.demand || regionChanged || republish)
         MinecraftTerrain::Publish(*this, pendingDemand, entity, ++player.demandRevision,
-                                  player.demand, next, refresh);
+                                  player.demand, next);
     }
     player.demand = next;
   }
@@ -925,7 +932,7 @@ private:
     if (!pose)
       return;
     const auto& [x, y, z, yaw, pitch, head, flags, mainSwing, offSwing, mainItem, offItem,
-                 headItem, chestItem, legsItem, feetItem] = *pose;
+                 headItem, chestItem, legsItem, feetItem, motionX, motionY, motionZ, motionSequence] = *pose;
     player.position = std::array{x, y, z};
     player.poseDirty = true;
     auto& bytes = player.pose;
@@ -940,13 +947,23 @@ private:
     bytes.push_back(static_cast<std::uint8_t>(flags));
     for (double value : {mainSwing, offSwing, mainItem, offItem, headItem, chestItem, legsItem, feetItem})
       AppendBigEndian(bytes, static_cast<std::uint32_t>(static_cast<std::int32_t>(value)));
+    for (double value : {motionX, motionY, motionZ})
+      AppendBigEndian(bytes, std::bit_cast<std::uint32_t>(static_cast<float>(value)));
+    AppendBigEndian(bytes, static_cast<std::uint64_t>(motionSequence));
   }
 
   void PublishPose(AtlasNet::AtlasNetEntityID entity, Player& player)
   {
     CapturePose(entity, player);
-    if (!std::exchange(player.poseDirty, false))
+    const auto now = std::chrono::steady_clock::now();
+    const bool changed = std::exchange(player.poseDirty, false);
+    if (!changed && (!player.poseNeedsConfirmation || now < player.poseConfirmAt))
       return;
+    // Confirm the final resting pose/actions reliably when updates stop. This
+    // prevents a lost last datagram from leaving a moving or stale replica.
+    player.poseNeedsConfirmation = changed;
+    if (changed)
+      player.poseConfirmAt = now + std::chrono::milliseconds(100);
     const auto& [x, y, z] = player.position;
     if (!player.publishedPosition || *player.publishedPosition != player.position)
     {
@@ -955,7 +972,16 @@ private:
     }
     AtlasNet::Spatial::Query audience{.world = Overworld,
         .shape = AtlasNet::Spatial::Sphere{.center = {x, y, z}, .radius = player.trackingRange}};
-    DispatchSignal(audience, 0x4d430106, std::as_bytes(std::span(player.pose)));
+    // The confirmation has the same revision. Leave it unordered so ingress
+    // does not discard it after sending the original unreliable datagram;
+    // the client's pose revision still rejects stale/duplicate application.
+    DispatchSignal(audience, 0x4d430106, std::as_bytes(std::span(player.pose)),
+        {.delivery = changed ? AtlasNet::Module::GameplayDelivery::Unreliable
+                             : AtlasNet::Module::GameplayDelivery::Reliable,
+         .ordering = changed ? AtlasNet::Module::GameplayOrdering::Sequenced
+                             : AtlasNet::Module::GameplayOrdering::Unordered,
+         .batching = AtlasNet::Module::GameplayBatching::Immediate, .stream = 3},
+        entity, player.revision);
   }
 
   void ObservePlayers(AtlasNet::AtlasNetEntityID observer, Player& player)

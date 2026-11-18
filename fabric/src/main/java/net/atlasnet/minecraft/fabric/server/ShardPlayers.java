@@ -33,6 +33,9 @@ import net.minecraft.network.protocol.game.ClientboundForgetLevelChunkPacket;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.network.protocol.game.ClientboundRespawnPacket;
+import net.minecraft.network.protocol.game.ClientboundUpdateRecipesPacket;
+import net.minecraft.network.protocol.game.ClientboundRecipePacket;
+import net.minecraft.network.protocol.game.ClientboundCommandsPacket;
 import net.minecraft.network.protocol.game.ClientboundChunkBatchStartPacket;
 import net.minecraft.network.protocol.game.ClientboundLightUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundSetChunkCacheCenterPacket;
@@ -371,11 +374,13 @@ public final class ShardPlayers {
             connection.lastMovementSequence = incoming.tag().getLong("AtlasNetMovementSequence");
             loadingTransfer = incoming.player();
             transferTag = incoming.tag();
+            connection.continuingSession = true;
             try {
                 server.getPlayerList().placeNewPlayer(connection, incoming.player(), incoming.cookie());
             } finally {
                 loadingTransfer = null;
                 transferTag = null;
+                connection.continuingSession = false;
             }
             incoming.player().setSprinting(incoming.tag().getBoolean("AtlasNetSprinting"));
             incoming.player().setShiftKeyDown(incoming.tag().getBoolean("AtlasNetCrouching"));
@@ -430,6 +435,16 @@ public final class ShardPlayers {
             }
             if (!isFrozen(player)) {
                 return false;
+            }
+            var connection = connections.get(entityId);
+            if (connection != null && ShardChunkIO.current() != null) {
+                var acknowledged = new java.util.HashSet<ChunkPos>();
+                connection.deliveredTerrain.forEach((pos, delivery) -> {
+                    if (delivery.acknowledged) {
+                        acknowledged.add(pos);
+                    }
+                });
+                chunkDemand.retainClientChunks(entityId, acknowledged);
             }
             server.getPlayerList().remove(player);
             players.remove(entityId);
@@ -615,7 +630,8 @@ public final class ShardPlayers {
 
     private record Pose(double x, double y, double z, float yaw, float pitch, float head, int flags,
                         int mainSwing, int offSwing, int mainItem, int offItem, int headItem, int chestItem,
-                        int legsItem, int feetItem) {}
+                        int legsItem, int feetItem, float motionX, float motionY, float motionZ,
+                        long motionSequence) {}
     private record ChunkWindow(int x, int z, int view, int simulation) {}
 
     public static double[] takePose(long entityId) {
@@ -624,7 +640,8 @@ public final class ShardPlayers {
         return position == null ? null : new double[] {position.x(), position.y(), position.z(),
                 position.yaw(), position.pitch(), position.head(), position.flags(),
                 position.mainSwing(), position.offSwing(), position.mainItem(), position.offItem(),
-                position.headItem(), position.chestItem(), position.legsItem(), position.feetItem()};
+                position.headItem(), position.chestItem(), position.legsItem(), position.feetItem(),
+                position.motionX(), position.motionY(), position.motionZ(), position.motionSequence()};
     }
 
     public static byte[] nextPacket(long entityId) {
@@ -658,6 +675,7 @@ public final class ShardPlayers {
         private final ArrayDeque<DeferredInteraction> deferredInteractions = new ArrayDeque<>();
         private final ArrayDeque<DeferredInteraction> handoffInputs = new ArrayDeque<>();
         private boolean handoffLogin;
+        private boolean continuingSession;
         private volatile boolean playAcknowledged;
         private int mainSwing;
         private int offSwing;
@@ -667,6 +685,8 @@ public final class ShardPlayers {
         private int respawnTeleport = -1;
         private int pendingTeleport = -1;
         private Pose lastPose;
+        private int lastPoseTick;
+        private long lastPoseSequence;
         private ChunkWindow lastDemand;
         private final ProtocolInfo<?> play;
         private ProtocolInfo<?> inbound;
@@ -678,8 +698,20 @@ public final class ShardPlayers {
         }
 
         void recordPose(ServerPlayer player) {
-            if (hasPendingTeleport()) {
+            if (hasPendingTeleport() || (handoffTeleport >= 0 && lastPose != null)) {
                 return;
+            }
+            int tick = player.server.getTickCount();
+            // Input accumulated during migration can replay in one server
+            // tick. Its client sequence prevents that catch-up distance from
+            // becoming an inflated velocity for the observer's prediction.
+            long elapsed = Math.max(tick - lastPoseTick, lastMovementSequence - lastPoseSequence);
+            float dx = lastPose == null || elapsed <= 0 ? 0 : (float) ((player.getX() - lastPose.x()) / elapsed);
+            float dy = lastPose == null || elapsed <= 0 ? 0 : (float) ((player.getY() - lastPose.y()) / elapsed);
+            float dz = lastPose == null || elapsed <= 0 ? 0 : (float) ((player.getZ() - lastPose.z()) / elapsed);
+            // A replay/teleport is not a velocity sample for visual prediction.
+            if (dx * dx + dy * dy + dz * dz > 2.25f) {
+                dx = dy = dz = 0;
             }
             var pose = new Pose(player.getX(), player.getY(), player.getZ(), player.getYRot(),
                     player.getXRot(), player.getYHeadRot(), (player.isShiftKeyDown() ? 1 : 0)
@@ -689,11 +721,14 @@ public final class ShardPlayers {
                     | (player.isSwimming() ? 64 : 0) | (player.isFallFlying() ? 128 : 0),
                     mainSwing, offSwing, itemId(player, EquipmentSlot.MAINHAND), itemId(player, EquipmentSlot.OFFHAND),
                     itemId(player, EquipmentSlot.HEAD), itemId(player, EquipmentSlot.CHEST),
-                    itemId(player, EquipmentSlot.LEGS), itemId(player, EquipmentSlot.FEET));
+                    itemId(player, EquipmentSlot.LEGS), itemId(player, EquipmentSlot.FEET), dx, dy, dz,
+                    lastMovementSequence);
             if (!pose.equals(lastPose)) {
                 lastPose = pose;
                 transform.set(pose);
             }
+            lastPoseTick = tick;
+            lastPoseSequence = lastMovementSequence;
         }
 
         private static int itemId(ServerPlayer player, EquipmentSlot slot) {
@@ -925,6 +960,12 @@ public final class ShardPlayers {
         @Override
         public void send(Packet<?> packet, PacketSendListener listener, boolean flush) {
             if (packet instanceof ClientboundSystemChatPacket) {
+                return;
+            }
+            // A handoff keeps the client's registry, recipes, and command tree.
+            // Vanilla login would queue these large snapshots before its position acknowledgement.
+            if (continuingSession && (packet instanceof ClientboundUpdateRecipesPacket
+                    || packet instanceof ClientboundRecipePacket || packet instanceof ClientboundCommandsPacket)) {
                 return;
             }
             if (packet instanceof BundlePacket<?> bundle) {

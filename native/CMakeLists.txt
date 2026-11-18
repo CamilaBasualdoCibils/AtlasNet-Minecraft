@@ -1,8 +1,15 @@
 enable_language(CXX)
 
+if(NOT ATLASNET_SDK_SOURCE_DIR)
+  if(AtlasNet_SOURCE_DIR)
+    set(ATLASNET_SDK_SOURCE_DIR "${AtlasNet_SOURCE_DIR}")
+  else()
+    set(ATLASNET_SDK_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../AtlasNet" CACHE PATH
+        "AtlasNet source used to build the node and module SDK")
+  endif()
+endif()
+
 if(NOT TARGET AtlasNetModule)
-  set(ATLASNET_SDK_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../AtlasNet" CACHE PATH
-      "AtlasNet source used to build the node and module SDK")
   set(ATLASNET_SDK_BUILD_DIR "${ATLASNET_SDK_SOURCE_DIR}/build" CACHE PATH
       "Existing AtlasNet build used by the local stack")
   load_cache("${ATLASNET_SDK_BUILD_DIR}" READ_WITH_PREFIX SDK_
@@ -35,6 +42,13 @@ add_library(AtlasNetMinecraftShard MODULE MinecraftShardModule.cpp)
 target_compile_features(AtlasNetMinecraftShard PRIVATE cxx_std_23)
 target_link_libraries(AtlasNetMinecraftShard PRIVATE AtlasNetModule)
 set_target_properties(AtlasNetMinecraftShard PROPERTIES PREFIX "")
+
+if(NOT TARGET AtlasNetXAxisSplit)
+  add_subdirectory("${ATLASNET_SDK_SOURCE_DIR}/Examples/Heuristics/XAxisSplit"
+                   "${CMAKE_CURRENT_BINARY_DIR}/xsplit" EXCLUDE_FROM_ALL)
+  target_compile_features(AtlasNetXAxisSplit PRIVATE cxx_std_23)
+endif()
+add_dependencies(BuildServer AtlasNetXAxisSplit)
 
 target_include_directories(AtlasNetMinecraftShard PRIVATE
     "${_minecraft_java_home}/include" "${_minecraft_java_home}/include/linux")

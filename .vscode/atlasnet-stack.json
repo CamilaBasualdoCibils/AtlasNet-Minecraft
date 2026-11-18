@@ -5,6 +5,7 @@
   "gdb": "${workspaceFolder}/scripts/minecraft-stack-gdb",
   "clusterPort": 42000,
   "handshakePort": 43000,
+  "controlPanelPort": 8080,
   "ignoreShutdownSignals": true,
   "valgrind": false,
   "valgrindProgram": "/usr/bin/valgrind",
@@ -20,7 +21,7 @@
   "clusterSettings": {
     "spatialPlane": "XZ",
     "controller": {
-      "heuristic": "KMeans2D",
+      "heuristic": "atlasnet.kmeans2d",
       "autoscale": {
         "enabled": false
       },
@@ -29,10 +30,13 @@
       },
       "shards": {
         "desired_count": 2
-      }
+      },
+      "dimension": 2
     },
     "region_transfer": {
-      "hysteresis_distance": 0
+      "hysteresis_distance": 0,
+      "mode": "batched",
+      "batch_interval": "50ms"
     }
   },
   "groups": [
@@ -43,7 +47,8 @@
         "Database",
         "Shard",
         "ControllerEligible",
-        "ClientIngress"
+        "ClientIngress",
+        "ControlPanel"
       ],
       "args": [],
       "nodeMode": "direct",
@@ -55,14 +60,19 @@
         },
         "modules": [
           "${workspaceFolder}/build/native/AtlasNetMinecraftShard.so",
-          "${workspaceFolder}/../AtlasNet/build/AtlasNetSteamNetSock.so"
+          "${workspaceFolder}/../AtlasNet/build/AtlasNetSteamNetSock.so",
+          "${workspaceFolder}/build/native/xsplit/AtlasNetXAxisSplit.so"
         ],
+        "control_panel": {
+          "address": "127.0.0.1",
+          "port": 8080
+        },
         "ingress": [
           {
             "transport": "SteamNetSock",
             "port": 5919,
             "admission": "AllowAll",
-            "spawn": "Static(minecraft:overworld,-16:64:0)"
+            "spawn": "Static(minecraft:overworld,-12:-60:0)"
           }
         ]
       }
@@ -86,14 +96,15 @@
         },
         "modules": [
           "${workspaceFolder}/build/native/AtlasNetMinecraftShard.so",
-          "${workspaceFolder}/../AtlasNet/build/AtlasNetSteamNetSock.so"
+          "${workspaceFolder}/../AtlasNet/build/AtlasNetSteamNetSock.so",
+          "${workspaceFolder}/build/native/xsplit/AtlasNetXAxisSplit.so"
         ],
         "ingress": [
           {
             "transport": "SteamNetSock",
             "port": 5920,
             "admission": "AllowAll",
-            "spawn": "Static(minecraft:overworld,-16:64:0)"
+            "spawn": "Static(minecraft:overworld,12:-60:6)"
           }
         ]
       }
