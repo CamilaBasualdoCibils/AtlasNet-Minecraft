@@ -6,20 +6,27 @@ receives Minecraft world packets and demo chat through AtlasNet Signals.
 
 ## Build and run
 
-Install CMake 3.20 or newer and a JDK 21. Put the JDK on PATH, set
+Install CMake 3.25 or newer, Ninja, Clang, vcpkg, and a JDK 21. Set
+`VCPKG_ROOT` to the vcpkg installation. Put the JDK on PATH, set
 `JAVA_HOME`, or pass `-DATLASNET_MINECRAFT_JAVA_HOME=/path/to/jdk21` at CMake
 configuration. For direct Gradle commands, use `JAVA_HOME`. The first Gradle
 build downloads dependencies.
 
 ```sh
-cmake -S . -B build
-cmake --build build --target minecraft-build
+git submodule update --init --recursive
+cmake --preset minecraft
+cmake --build build --target BuildServer --parallel 2
+cmake --build build --target BuildClient --parallel 2
 cmake --build build --target minecraft-client
 cmake --build build --target minecraft-server
 ```
 
-CMake delegates to `./gradlew :fabric:build`, `./gradlew :fabric:runClient`,
-and `./gradlew :fabric:runServer`, respectively. Launch targets run in the
+CMake builds AtlasNet from the `AtlasNet/` submodule in the same build graph,
+then delegates the Minecraft Java tasks to Gradle. No separately configured
+AtlasNet checkout or prebuilt SDK is required. The `server` and `client` build
+presets also select `BuildServer` and `BuildClient` with two build jobs.
+`minecraft-build`, `minecraft-client`, and `minecraft-server` remain available
+as Gradle build/client/server targets. Launch targets run in the
 foreground. The client needs a graphical session. The server runs with
 `nogui`. Enter `stop` at its console to shut it down cleanly.
 
@@ -48,17 +55,18 @@ The Gradle wrapper pins Gradle 9.2.1. The build pins Fabric Loom 1.14.10 and
 Fabric Loader 0.20.1, and uses Minecraft 1.21.1's official Mojang mappings.
 The bootstrap uses only the entrypoint interfaces supplied by Fabric Loader.
 
-## Include in a parent CMake build
+## AtlasNet CMake dependency
 
-A parent project can register the same three targets with:
+The root project uses `add_subdirectory(AtlasNet)`. The native shard module
+links the actual `AtlasNetModule` target; the client bridge links the actual
+`AtlasNetClient` and `AtlasNetModule` targets. Their include paths, definitions,
+libraries, and rebuild dependencies come from AtlasNet's CMake targets.
+The `minecraft` configure preset uses the submodule's vcpkg manifest and Clang
+triplet. To migrate an old SDK-based build directory, configure once with
+`cmake --fresh --preset minecraft`.
 
-```cmake
-add_subdirectory("/path/to/AtlasNet-Minecraft" minecraft-demo)
-```
-
-If the parent build uses Java 25, point `ATLASNET_MINECRAFT_JAVA_HOME` at a
-separate JDK 21 installation. The native shard module and client JNI bridge
-link against the AtlasNet SDK. Fabric uses these bridges directly; generated
+The Minecraft runtime remains Java 21 independently of any optional AtlasNet
+Java binding runtime. Fabric uses the Minecraft-owned bridges directly; generated
 GObject/Java bindings and the NeoForge adapter are outside this path.
 
 ## AtlasNet protocol groundwork
@@ -150,16 +158,17 @@ through its ownership transfers.
 
 Open this repository as a single folder in VS Code and run **AtlasNet: Open
 Local Stack**, then **Run stack**. The [stack configuration](.vscode/atlasnet-stack.json)
-starts two AtlasNet nodes with one shard each and the module-registered
-`example.xsplit2d` heuristic on AtlasNet's XZ spatial plane. It loads AtlasNet's
-`Examples/Heuristics/XAxisSplit` module on both nodes. The boundary stays at
-`x = 0`, with one unbounded region on each side. Both nodes use the Database, Shard,
+starts two AtlasNet nodes with one shard each and the `atlasnet.kmeans2d`
+heuristic on AtlasNet's XZ spatial plane. Both nodes also load the upstream
+`Examples/Heuristics/XAxisSplit` module, selectable as `example.xsplit2d` for a
+fixed boundary at x=0. Both nodes use the Database, Shard,
 ControllerEligible, and ClientIngress capabilities, the same Minecraft settings, and a shared AtlasNet
 Valkey process. Their SteamNetSock ingress ports are `5919` and `5920`. The
 stack tool assigns distinct cluster and handshake ports. Connect one Fabric
 client to each ingress endpoint through Multiplayer. Endpoint A spawns at
-`(-12, -60, 0)` and B at `(12, -60, 6)` in superflat terrain. Walk across `x = 0`
-and verify the shard UUID changes in the metrics overlay. Crossing a drawn
+`(-12, -60, 0)` and B at `(12, -60, 6)`; regular terrain raises an obstructed
+spawn to the surface. Verify the shard UUID changes in the metrics overlay
+when walking across the active region boundary. Crossing a drawn
 boundary alone does not prove an authority transfer. Transfers use AtlasNet's
 batched coordinator with a 50 ms batch interval and zero hysteresis.
 
@@ -178,40 +187,38 @@ detach the Minecraft shard workers at fork. This lets Java handle its own
 signals and start its helper processes. Attach a debugger to a worker
 separately when needed.
 
-The configuration uses a sibling AtlasNet checkout at `../AtlasNet` with
-SteamNetSock enabled. Configure and build AtlasNet's module SDK once so the
-Minecraft project can locate its library and dependency headers.
+The configuration uses only the `AtlasNet/` submodule and the combined
+Minecraft build directory. The stack prelaunch configures the `minecraft`
+preset and builds `BuildServer`, including its AtlasNet dependencies.
 
 ```sh
-cmake -S . -B build
-cmake --build build --target BuildServer
+cmake --preset minecraft
+cmake --build build --target BuildServer --parallel 2
 ```
 
 The stack panel runs `BuildServer` before launch. That target builds
-`build/native/AtlasNetMinecraftShard.so`, `build/native/xsplit/AtlasNetXAxisSplit.so`,
-and the Fabric artifact. The panel
-launches the prebuilt AtlasNet node and Valkey using the saved configuration.
-Provision the node, worker, SteamNetSock module, and Valkey before launching.
-The Minecraft build reads the AtlasNet SDK without rebuilding it.
+the Fabric artifact and `build/native/AtlasNetMinecraftShard.so`, together with
+AtlasNet's existing `AtlasNetNode`, `AtlasNetShardWorker`, `AtlasNetSteamNetSock`,
+`AtlasNetXAxisSplit`, and `Valkey-Server-Compile` targets. Node and worker
+executables and the SteamNetSock module live in `build/AtlasNet/`. The X-axis
+module lives in `build/AtlasNet/Examples/Heuristics/XAxisSplit/`, and Valkey is
+built in `build/_deps/valkey-src/src/`. Missing or changed dependencies rebuild
+when you build the Minecraft server; no separate AtlasNet build is needed.
 
 `BuildClient` builds the Fabric artifact and its SteamNetSock JNI library. `RunClient` builds it and launches
 Loom's Fabric client. `RunServer` builds the server dependencies and launches
 Loom's standalone Fabric dedicated server. Use the stack panel to run the
 AtlasNet node and its shard workers.
 
-For a different AtlasNet checkout or build directory, set
-`ATLASNET_SDK_SOURCE_DIR` and `ATLASNET_SDK_BUILD_DIR` in CMake and update the
-executable and module paths in the stack configuration to match.
-
 The native plugin launches Fabric inside each shard worker JVM. Use the
 local development EULA setup above before starting the stack. Minecraft's
-working files live under `fabric/run/server/valkey-shards/<shard-id>` and the
+working files live under `fabric/run/server/valkey-normal-shards/<shard-id>` and the
 workers share the Overworld's chunk data through Minecraft Valkey.
 
 
 The stack prelaunch also starts Minecraft's dedicated Valkey at
-`redis://127.0.0.1:46381/0` with append-only persistence in
-`run/minecraft-valkey`. Connection browsers need a separate entry for this
+`redis://127.0.0.1:46382/0` with append-only persistence in
+`run/minecraft-valkey-normal`. Connection browsers need a separate entry for this
 instance. The stack panel manages AtlasNet's Valkey on port `46380`. After
 stopping the stack, run `python3 scripts/minecraft-valkey.py stop` to save and
 stop the Minecraft instance.
@@ -280,7 +287,8 @@ AtlasNet entity lifecycles and transfer their vanilla entity state separately. M
 against a remote player uses EntityRPC to resolve the hit on that player's
 authoritative shard.
 
-The Stack Tool currently uses superflat for repeatable boundary tests. Both shards read the same seed
+The saved Stack Tool settings use regular terrain; the automated migration
+fixture uses superflat and the fixed X-axis heuristic. Both shards read the same seed
 and world ID from `minecraft:v1:world:minecraft:overworld` in Minecraft Valkey.
 An empty database receives one randomly generated seed and world ID. Existing
 terrain from the previous default configuration adopts its original seed
@@ -293,10 +301,10 @@ AtlasNet cluster data lives in the separate service on port `46380`.
 If terrain obstructs the configured placement, the Minecraft shard raises the
 player to the surface.
 
-Superflat terrain uses port `46381` and `run/minecraft-valkey`. To return to
-normal terrain, set `MINECRAFT_TERRAIN_PRESET=normal` for the AtlasNet nodes and
+Superflat terrain uses port `46381` and `run/minecraft-valkey`. To switch to
+superflat, set `MINECRAFT_TERRAIN_PRESET=flat` for the AtlasNet nodes and
 the Minecraft Valkey startup command in the stack's `preLaunchCommand`.
-The launcher defaults to flat but respects that environment override.
+The launcher defaults to normal terrain and respects that environment override.
 
 The repeatable migration test builds the demo and uses the real Stack Tool
 configuration generator, two shard workers, and two graphical Fabric clients:
@@ -306,7 +314,8 @@ python3 tests/integration/migration.py --seconds 90 --label walking
 ```
 
 Run it from the repository root in a graphical session with JDK 21 and the
-AtlasNet SDK already built. It uses isolated Valkey data and ingress ports
+AtlasNet submodule initialized and `VCPKG_ROOT` set. It builds the required
+AtlasNet targets itself and uses isolated Valkey data and ingress ports
 `5971` and `5972`. The first client walks between x=-32 and x=32 while the
 second watches. It records shard UUID changes, position corrections, observer
 continuity, loading screens, client tick gaps, and slow server ticks under

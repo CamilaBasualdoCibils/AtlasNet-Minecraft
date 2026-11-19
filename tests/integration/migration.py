@@ -154,8 +154,8 @@ try:
         # javac -version is parsed by CMake; JAVA_TOOL_OPTIONS prepends a banner.
         build_env.pop('JAVA_TOOL_OPTIONS',None)
         with (directory/'build.log').open('w') as output:
-            for build in (['cmake','-S','.','-B','build'],
-                          ['cmake','--build','build','--target','BuildServer','BuildClient'],
+            for build in (['cmake','--preset','minecraft'],
+                          ['cmake','--build','build','--target','BuildServer','BuildClient','--parallel','2'],
                           ['./gradlew','--offline','-PatlasnetMigrationTest',
                            ':fabric:migrationTestClasses',':fabric:prepareShardServer']):
                 subprocess.run(build,cwd=ROOT,env=build_env,stdout=output,stderr=subprocess.STDOUT,check=True)

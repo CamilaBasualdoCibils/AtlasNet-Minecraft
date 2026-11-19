@@ -1,7 +1,7 @@
 {
-  "program": "${workspaceFolder}/../AtlasNet/build/AtlasNetNode",
+  "program": "${workspaceFolder}/build/AtlasNet/AtlasNetNode",
   "cwd": "${workspaceFolder}/build",
-  "preLaunchCommand": "cmake -S \"${workspaceFolder}\" -B \"${workspaceFolder}/build\" -DATLASNET_MINECRAFT_SHARD_MODULE=ON && cmake --build \"${workspaceFolder}/build\" --target BuildServer && env MINECRAFT_TERRAIN_PRESET=normal python3 \"${workspaceFolder}/scripts/minecraft-valkey.py\" start --stack-session",
+  "preLaunchCommand": "cmake --preset minecraft -S \"${workspaceFolder}\" && cmake --build \"${workspaceFolder}/build\" --target BuildServer --parallel 2 && env MINECRAFT_TERRAIN_PRESET=normal python3 \"${workspaceFolder}/scripts/minecraft-valkey.py\" start --stack-session",
   "gdb": "${workspaceFolder}/scripts/minecraft-stack-gdb",
   "clusterPort": 42000,
   "handshakePort": 43000,
@@ -14,7 +14,7 @@
   "perfOutput": "${workspaceFolder}/build/perf-${index}.data",
   "valkeyURI": "tcp://127.0.0.1:46380",
   "launchValkey": true,
-  "valkeyProgram": "${workspaceFolder}/../AtlasNet/build/_deps/valkey-src/src/valkey-server",
+  "valkeyProgram": "${workspaceFolder}/build/_deps/valkey-src/src/valkey-server",
   "initializeCluster": true,
   "clusterMode": "direct",
   "clusterConfigPath": "",
@@ -56,12 +56,12 @@
       "nodeSettings": {
         "shards": {
           "max_count": 1,
-          "worker_executable": "${workspaceFolder}/../AtlasNet/build/AtlasNetShardWorker"
+          "worker_executable": "${workspaceFolder}/build/AtlasNet/AtlasNetShardWorker"
         },
         "modules": [
           "${workspaceFolder}/build/native/AtlasNetMinecraftShard.so",
-          "${workspaceFolder}/../AtlasNet/build/AtlasNetSteamNetSock.so",
-          "${workspaceFolder}/build/native/xsplit/AtlasNetXAxisSplit.so"
+          "${workspaceFolder}/build/AtlasNet/AtlasNetSteamNetSock.so",
+          "${workspaceFolder}/build/AtlasNet/Examples/Heuristics/XAxisSplit/AtlasNetXAxisSplit.so"
         ],
         "control_panel": {
           "address": "127.0.0.1",
@@ -92,12 +92,12 @@
       "nodeSettings": {
         "shards": {
           "max_count": 1,
-          "worker_executable": "${workspaceFolder}/../AtlasNet/build/AtlasNetShardWorker"
+          "worker_executable": "${workspaceFolder}/build/AtlasNet/AtlasNetShardWorker"
         },
         "modules": [
           "${workspaceFolder}/build/native/AtlasNetMinecraftShard.so",
-          "${workspaceFolder}/../AtlasNet/build/AtlasNetSteamNetSock.so",
-          "${workspaceFolder}/build/native/xsplit/AtlasNetXAxisSplit.so"
+          "${workspaceFolder}/build/AtlasNet/AtlasNetSteamNetSock.so",
+          "${workspaceFolder}/build/AtlasNet/Examples/Heuristics/XAxisSplit/AtlasNetXAxisSplit.so"
         ],
         "ingress": [
           {

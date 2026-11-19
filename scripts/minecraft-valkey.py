@@ -4,7 +4,6 @@ import argparse
 import fcntl
 import os
 from pathlib import Path
-import shutil
 import socket
 import subprocess
 import sys
@@ -79,11 +78,9 @@ def start(port, directory):
     if compatible_instance(port, directory):
         print(f"Minecraft Valkey already running at 127.0.0.1:{port}")
         return
-    executable = os.environ.get("MINECRAFT_VALKEY_SERVER") or shutil.which("valkey-server")
-    if not executable:
-        executable = ROOT.parent / "AtlasNet/build/_deps/valkey-src/src/valkey-server"
+    executable = os.environ.get("MINECRAFT_VALKEY_SERVER") or ROOT / "build/_deps/valkey-src/src/valkey-server"
     if not os.access(executable, os.X_OK):
-        raise RuntimeError("Cannot find valkey-server. Set MINECRAFT_VALKEY_SERVER to its executable path")
+        raise RuntimeError("Build the BuildServer target first, or set MINECRAFT_VALKEY_SERVER to valkey-server")
     subprocess.run([str(executable), "--bind", "127.0.0.1", "--port", str(port),
                     "--dir", str(directory), "--dbfilename", "minecraft.rdb",
                     "--appendonly", "yes", "--appendfsync", "everysec",
