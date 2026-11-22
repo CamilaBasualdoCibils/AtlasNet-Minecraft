@@ -1,13 +1,15 @@
-pluginManagement {
-    repositories {
-        maven("https://maven.fabricmc.net/")
-        gradlePluginPortal()
-    }
-    plugins {
-        id("fabric-loom") version providers.gradleProperty("loom_version").get()
-    }
-}
-
 rootProject.name = "atlasnet-minecraft"
-include("common", "fabric")
-// NeoForge is deliberately not a Gradle project yet.
+
+include(
+    "common:core",
+    "common:mod",
+    "atlasnet-plugin",
+    "atlasnet-endpoint",
+    "atlasnet-admissionHandler",
+    "atlasnet-spawnResolver",
+    "atlasnet-mod:client",
+    "atlasnet-mod:server",
+    "examples:plugin",
+    "examples:mod:client",
+    "examples:mod:server",
+)

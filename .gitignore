@@ -16,3 +16,7 @@ cmake_install.cmake
 
 /.vscode/atlasnet-generated/
 /.build/stacklogs/
+
+/legacy/.build/stacklogs/
+/legacy/.cache/
+/legacy/.vscode/atlasnet-generated/

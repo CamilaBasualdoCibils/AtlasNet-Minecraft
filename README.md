@@ -1,347 +1,85 @@
-# AtlasNet Minecraft Demo
+# AtlasNet Minecraft
 
-This Fabric demo for Minecraft Java Edition 1.21.1 runs dedicated servers
-inside AtlasNet shard workers. The client joins through SteamNetSock and
-receives Minecraft world packets and demo chat through AtlasNet Signals.
+AtlasNet Minecraft is the foundation for a public Minecraft integration with
+AtlasNet. The active projects provide Java API contracts and compile-only
+examples. Minecraft gameplay, networking, distributed simulation, and loader
+adapters are future work.
 
-## Build and run
+The server plugin is designed to serve vanilla Minecraft clients and clients
+with the optional AtlasNet mod in the same authoritative simulation. The client
+mod is designed to retain ordinary Minecraft connectivity and negotiate a native
+AtlasNet session on servers that support it. See the [architecture](docs/architecture.md)
+for the planned connections, admission policy, and platform boundaries.
 
-Install CMake 3.25 or newer, Ninja, Clang, vcpkg, and a JDK 21. Set
-`VCPKG_ROOT` to the vcpkg installation. Put the JDK on PATH, set
-`JAVA_HOME`, or pass `-DATLASNET_MINECRAFT_JAVA_HOME=/path/to/jdk21` at CMake
-configuration. For direct Gradle commands, use `JAVA_HOME`. The first Gradle
-build downloads dependencies.
+## Projects
 
-```sh
-git submodule update --init --recursive
-cmake --preset minecraft
-cmake --build build --target BuildServer --parallel 2
-cmake --build build --target BuildClient --parallel 2
-cmake --build build --target minecraft-client
-cmake --build build --target minecraft-server
-```
+| Gradle project | Responsibility |
+| --- | --- |
+| `:common:core` | Platform-independent shared values, currently a namespaced resource key |
+| `:common:mod` | Content definitions and registry contracts shared by client and server |
+| `:atlasnet-plugin` | Base server lifecycle, world and entity access, events, scheduling, and authority contracts |
+| `:atlasnet-endpoint` | Node ingress endpoint scaffold |
+| `:atlasnet-admissionHandler` | Client admission provider scaffold |
+| `:atlasnet-spawnResolver` | Initial spawn resolver scaffold |
+| `:atlasnet-mod:client` | Client mod content registration contract, independent of server APIs |
+| `:atlasnet-mod:server` | Server mod lifecycle and content synchronization contracts layered on the plugin API |
 
-CMake builds AtlasNet from the `AtlasNet/` submodule in the same build graph,
-then delegates the Minecraft Java tasks to Gradle. No separately configured
-AtlasNet checkout or prebuilt SDK is required. The `server` and `client` build
-presets also select `BuildServer` and `BuildClient` with two build jobs.
-`minecraft-build`, `minecraft-client`, and `minecraft-server` remain available
-as Gradle build/client/server targets. Launch targets run in the
-foreground. The client needs a graphical session. The server runs with
-`nogui`. Enter `stop` at its console to shut it down cleanly.
+Examples live at `examples/plugin/`, `examples/mod/client/`, and
+`examples/mod/server/`. Each declares a single dependency on its corresponding
+SDK. Future adapter notes live under `platforms/`. The archived prototype and
+its original build files are under [`legacy/`](legacy/README.md). The
+AtlasNet submodule remains at `AtlasNet/`. The Minecraft build excludes the
+archive and consumes prebuilt AtlasNet Java bindings.
 
-Read the [Minecraft EULA](https://www.minecraft.net/eula) before starting the
-development server. If you agree, run the following once before launching it.
-This opt-in writes `fabric/run/server/eula.txt` and also works in unattended
-development setup.
+## Build
 
-```sh
-./gradlew :fabric:acceptDevServerEula
-```
-
-Client options and logs live under `fabric/run/client`. The dedicated server
-keeps its world, configuration, and logs under `fabric/run/server`.
-
-## Project layout
-
-- `common` contains loader-independent code. Fabric includes its classes in
-  the remapped mod JAR at `fabric/build/libs/atlasnet-fabric-0.1.0-dev.jar`.
-- `fabric` provides loader entrypoints and uses Loom's isolated client source
-  set. Its mod ID is `atlasnet_minecraft`.
-- `neoforge` reserves space for a future loader adapter. Gradle configures only
-  `common` and `fabric`.
-
-The Gradle wrapper pins Gradle 9.2.1. The build pins Fabric Loom 1.14.10 and
-Fabric Loader 0.20.1, and uses Minecraft 1.21.1's official Mojang mappings.
-The bootstrap uses only the entrypoint interfaces supplied by Fabric Loader.
-
-## AtlasNet CMake dependency
-
-The root project uses `add_subdirectory(AtlasNet)`. The native shard module
-links the actual `AtlasNetModule` target; the client bridge links the actual
-`AtlasNetClient` and `AtlasNetModule` targets. Their include paths, definitions,
-libraries, and rebuild dependencies come from AtlasNet's CMake targets.
-The `minecraft` configure preset uses the submodule's vcpkg manifest and Clang
-triplet. To migrate an old SDK-based build directory, configure once with
-`cmake --fresh --preset minecraft`.
-
-The Minecraft runtime remains Java 21 independently of any optional AtlasNet
-Java binding runtime. Fabric uses the Minecraft-owned bridges directly; generated
-GObject/Java bindings and the NeoForge adapter are outside this path.
-
-## AtlasNet protocol groundwork
-
-The shared `net.atlasnet.minecraft.atlasnet.protocol` package defines the
-application IDs and payload codecs for `ChatCommand`, `ChatSignal`,
-`PlayerJoinedSignal`, `PlayerLeftSignal`, and `PlayerRegionSignal`. The codecs
-operate on payload bytes for the AtlasNet raw Command and Signal APIs. Chat
-commands carry text only. Region payloads preserve AtlasNet's signed region ID,
-generation bits, dimension, bounds, and clipping planes. Missing geometry can be
-represented explicitly. `./gradlew :common:check` runs the codec checks.
-
-The shard plugin embeds the Fabric dedicated server using the Java 21 JVM.
-`BuildServer` exports the development launch configuration from Loom. In
-shard mode the server suppresses its vanilla TCP listener. The worker uses
-`OnClientSpawn` to call the Fabric player adapter, which creates players on
-the Minecraft server thread with identities derived from AtlasNet client IDs.
-
-`RunClient` loads the Minecraft-owned JNI bridge. Multiplayer and Direct
-Connect use AtlasNet's Client API over SteamNetworkingSockets and display
-connection status. The demo uses the AtlasNet SteamNetSock ingress module and
-has no dependency on the SimpleGame example.
-Configuration and play packets use Minecraft's codecs and travel as ordered
-AtlasNet Signals. Terrain batches use a separate stream from gameplay packets.
-AtlasNet ingress monitors session liveness across worker transfers.
-Chat uses an AtlasNet Command and broadcast Signal. Join and
-leave use broadcast Signals, and each player's shard sends its region
-descriptor directly. In the world, use `/atlasnet client showRegion true` or
-`/atlasnet client showRegion false` to toggle the region ID, the blue 16×16
-Minecraft chunk grid, and the orange AtlasNet authority edges. The orange
-edges come from the heuristic's XZ planes and bounds and are clipped near
-the camera.
-The top-left shard UUID is visible by default. Use
-`/atlasnet client metrics false` to hide it or `/atlasnet client metrics true`
-to restore it.
-The shard starts only `minecraft:overworld` and rejects other spawn
-dimensions. AtlasNet's reserved Overworld ID is `0` in `AtlasNetWorlds`.
-
-Movement and posture commands use Minecraft's play packet codec. The owning
-shard resolves the player from the AtlasNet command context and invokes the
-normal Minecraft movement listener on the server thread. It publishes accepted
-position changes to AtlasNet. Visibility uses SpatialInterest for both local
-and remote observers, with one stable client replica per visible player.
-An authoritative pose snapshot initializes the replica. Spatial Signals then
-carry movement, held items, hand swings, and item-use state.
-Pose updates include measured motion and the existing client movement sequence.
-They use immediate sequenced Signals on stream 3, with a reliable confirmation
-when a pose settles. Remote players retain vanilla interpolation and bridge
-short authority gaps with bounded visual prediction. Late source poses retain
-their sample age, so they do not rewind a player that has already been drawn
-past that checkpoint. Remote replicas do not simulate authoritative gameplay.
-In shared terrain mode, one scoped SpatialRPC discovers nearby player poses
-without sending an EntityRPC to each terrain entity in the interest.
-Visibility transitions use the direct recipient API because the current
-AtlasNet Signal router skips `Audience::Entities`.
-
-Walking beyond AtlasNet's region transfer threshold transfers a live player to
-the new shard. The source freezes the Minecraft player while the destination
-stages the player's compressed Minecraft NBT. The client keeps its Overworld,
-chunk cache, and SteamNetSock connection through the handoff. The client retains
-recent movement and replays input after acknowledging the destination's
-checkpoint. The server deduplicates replayed movement and still runs vanilla
-movement validation. Flight and client preferences transfer with the player.
-The destination reuses the client's recipes and command tree. Terrain demand
-changes viewer roles without forcing a full chunk refresh, and owner snapshot
-fragments remain valid across play epochs. The source retains acknowledged
-chunk deliveries; any unacknowledged local chunks can still be sent by their
-owner after handoff.
-The region overlay
-and shard UUID update after the destination receives input through AtlasNet's
-committed route. Living, unmounted, awake Overworld players are eligible for this
-handoff. Player statistics and advancements still use each worker's local files.
-Run matching builds of the client and shard module.
-
-The death-screen Respawn button uses Minecraft's normal Overworld spawn rules.
-The shard replaces the dead Minecraft player under the same AtlasNet identity
-and publishes the new position after the client acknowledges the respawn. If
-the spawn belongs to another shard, AtlasNet then transfers the live player
-through the existing connection.
-
-AtlasNet's heuristic workload weights are `1000` for players and `5` for managed
-mobs, projectiles and other active entities. Chunks and other entities have cost
-`0`. The shard passes the chunk and actor weights at
-registration. AtlasNet registers the admitted player itself, so the demo applies
-the player weight once when that client is ready. AtlasNet carries the weights
-through its ownership transfers.
-
-## Run the AtlasNet local stack
-
-Open this repository as a single folder in VS Code and run **AtlasNet: Open
-Local Stack**, then **Run stack**. The [stack configuration](.vscode/atlasnet-stack.json)
-starts two AtlasNet nodes with one shard each and the `atlasnet.kmeans2d`
-heuristic on AtlasNet's XZ spatial plane. Both nodes also load the upstream
-`Examples/Heuristics/XAxisSplit` module, selectable as `example.xsplit2d` for a
-fixed boundary at x=0. Both nodes use the Database, Shard,
-ControllerEligible, and ClientIngress capabilities, the same Minecraft settings, and a shared AtlasNet
-Valkey process. Their SteamNetSock ingress ports are `5919` and `5920`. The
-stack tool assigns distinct cluster and handshake ports. Connect one Fabric
-client to each ingress endpoint through Multiplayer. Endpoint A spawns at
-`(-12, -60, 0)` and B at `(12, -60, 6)`; regular terrain raises an obstructed
-spawn to the surface. Verify the shard UUID changes in the metrics overlay
-when walking across the active region boundary. Crossing a drawn
-boundary alone does not prove an authority transfer. Transfers use AtlasNet's
-batched coordinator with a 50 ms batch interval and zero hysteresis.
-
-Edit the repository-root `server.properties` and restart the stack to apply
-settings to every shard. `view-distance` caps each client's Render Distance.
-`simulation-distance` controls how far chunks tick around a player.
-The shard copies the shared settings into its local
-runtime files and derives the terrain seed and save folder from Minecraft Valkey.
-The X-axis example intentionally always produces two regions. To test more
-shards, select a scalable registered heuristic such as `atlasnet.kmeans2d`,
-raise `desired_count`, and provide enough worker slots across its nodes.
-Minecraft routing itself does not depend on there being two shards.
-
-The stack uses `scripts/minecraft-stack-gdb` to debug the AtlasNet nodes and
-detach the Minecraft shard workers at fork. This lets Java handle its own
-signals and start its helper processes. Attach a debugger to a worker
-separately when needed.
-
-The configuration uses only the `AtlasNet/` submodule and the combined
-Minecraft build directory. The stack prelaunch configures the `minecraft`
-preset and builds `BuildServer`, including its AtlasNet dependencies.
+Use CMake 3.25 or later and the Gradle 9.2.1 wrapper. The plugin and
+client/server mod SDKs use JDK 21. The three ingress projects use JDK 25 and
+prebuilt AtlasNet binding JARs. See the [ingress module setup](docs/atlasnet-modules.md)
+before running the default build. The wrapper may download Gradle on first use.
 
 ```sh
-cmake --preset minecraft
-cmake --build build --target BuildServer --parallel 2
+cmake -S . -B build
+cmake --build build
+cmake --build build --target atlasnet-plugin
+cmake --build build --target atlasnet-endpoint
+cmake --build build --target atlasnet-admissionHandler
+cmake --build build --target atlasnet-spawnResolver
+cmake --build build --target atlasnet-mod-client
+cmake --build build --target atlasnet-mod-server
 ```
 
-The stack panel runs `BuildServer` before launch. That target builds
-the Fabric artifact and `build/native/AtlasNetMinecraftShard.so`, together with
-AtlasNet's existing `AtlasNetNode`, `AtlasNetShardWorker`, `AtlasNetSteamNetSock`,
-`AtlasNetXAxisSplit`, and `Valkey-Server-Compile` targets. Node and worker
-executables and the SteamNetSock module live in `build/AtlasNet/`. The X-axis
-module lives in `build/AtlasNet/Examples/Heuristics/XAxisSplit/`, and Valkey is
-built in `build/_deps/valkey-src/src/`. Missing or changed dependencies rebuild
-when you build the Minecraft server; no separate AtlasNet build is needed.
-
-`BuildClient` builds the Fabric artifact and its SteamNetSock JNI library. `RunClient` builds it and launches
-Loom's Fabric client. `RunServer` builds the server dependencies and launches
-Loom's standalone Fabric dedicated server. Use the stack panel to run the
-AtlasNet node and its shard workers.
-
-The native plugin launches Fabric inside each shard worker JVM. Use the
-local development EULA setup above before starting the stack. Minecraft's
-working files live under `fabric/run/server/valkey-normal-shards/<shard-id>` and the
-workers share the Overworld's chunk data through Minecraft Valkey.
-
-
-The stack prelaunch also starts Minecraft's dedicated Valkey at
-`redis://127.0.0.1:46382/0` with append-only persistence in
-`run/minecraft-valkey-normal`. Connection browsers need a separate entry for this
-instance. The stack panel manages AtlasNet's Valkey on port `46380`. After
-stopping the stack, run `python3 scripts/minecraft-valkey.py stop` to save and
-stop the Minecraft instance.
-Use `MINECRAFT_VALKEY_PORT`, `MINECRAFT_VALKEY_DIR`, or
-`MINECRAFT_VALKEY_SERVER` to override its port, data directory, or executable.
-
-To run the Valkey terrain mode, set `ATLASNET_MINECRAFT_VALKEY_TERRAIN=1` in the
-environment of the processes launching AtlasNet and configure a single shard
-with an unbounded XZ region. The worker uses compressed vanilla chunk NBT at
-`minecraft:v1:chunk:minecraft:overworld:<x>:<z>`. Valkey atomically fences
-records by authority epoch and save version. Loaded full chunks receive an
-AtlasNet entity at their horizontal center, and the worker releases that entity
-after the chunk unload and final queued write. The mode uses a separate local
-directory under `fabric/run/server/valkey-shards` for Minecraft's other files.
-Use `save-all flush` in the dedicated server console before stopping the stack
-to wait for outstanding terrain saves.
-
-Player view changes route chunk demand through SpatialRPC. The recipient shard
-uses the RPC's authority geometry to select chunk centers and updates vanilla
-loading tickets by observer. Block break and placement Commands use Minecraft's
-server-side packet handlers. Once a viewer acknowledges the initial chunk batch,
-tracked block updates that fit a single AtlasNet Signal use Spatial Audience.
-Initial chunks, unloads, and larger updates use Minecraft's viewer selection and
-the existing directed packet stream.
-
-The Stack Tool prelaunch prepares a shared terrain session for both workers.
-For a manual launcher, set `ATLASNET_MINECRAFT_VALKEY_TERRAIN=partitioned` in
-the AtlasNet node environment. Use a 2D heuristic with `cluster.spatialPlane`
-set to `XZ`.
-To exercise both owners, give the two ingress groups Overworld spawn positions
-on opposite sides of an AtlasNet boundary. Choose a safe elevation for each
-location in the generated terrain.
-Chunks belong to the shard containing their XZ center, independent of height.
-Nonowners can load read-only replicas for vanilla chunk dependencies. The owner
-sends the initial authoritative chunk and subsequent block changes to remote
-viewers through Spatial Signals. Nearby workers apply block deltas to their
-read-only collision replicas, ordered by the chunk's authority epoch and the
-owner's update sequence. Cross-shard block use and mining route through
-a SpatialRPC point at the target chunk center. The player owner validates input
-and reconciles inventory and prediction with the chunk owner's result. When a
-placement crosses a chunk ownership boundary, the clicked owner resolves the
-block interaction first and the placement owner applies the resulting action.
-The chunk owner also handles ordinary block interactions and tool uses,
-including axe stripping and daylight detector toggles. Locally owned block
-menus can open from either face of a chunk boundary. Remote chests and barrels
-use Minecraft's container screen. A remote click is checked against the current
-slots on the chunk owner before changing the container. A conflict refreshes the
-screen. Double chests require both halves to share a terrain owner. Dragging and
-dropping items from remote menus, and remote menus for other block types, are
-currently unsupported.
-
-To enable live chunk migration, give every node the same
-`MINECRAFT_TERRAIN_SESSION` UUID and set AtlasNet's region transfer hysteresis
-to zero. Use a new session UUID only after stopping every node from the
-previous run. The UUID identifies which workers can still own chunks in the
-shared Valkey database. With no session UUID, this mode requires a stable
-allocation of chunk centers and stops if ownership changes.
-
-Live migration uses AtlasNet's transfer callbacks and supports both axis-aligned
-regions and KMeans2D's region planes.
-The source freezes the chunk and reserves its saved revision in Valkey. The
-destination installs the checkpoint, including block entities and scheduled
-ticks, before resuming simulation. The transfer does not cover Minecraft's
-separate entity or POI files. Dropped items, mobs, and arrows use their own
-AtlasNet entity lifecycles and transfer their vanilla entity state separately. Melee
-against a remote player uses EntityRPC to resolve the hit on that player's
-authoritative shard.
-
-The saved Stack Tool settings use regular terrain; the automated migration
-fixture uses superflat and the fixed X-axis heuristic. Both shards read the same seed
-and world ID from `minecraft:v1:world:minecraft:overworld` in Minecraft Valkey.
-An empty database receives one randomly generated seed and world ID. Existing
-terrain from the previous default configuration adopts its original seed
-(`3955` for normal terrain, `0` for superflat).
-
-To start a new world, stop the stack, clear Minecraft Valkey DB 0, and run the
-stack again. The new world ID selects a fresh local save folder for each shard.
-The normal terrain store uses port `46382` and `run/minecraft-valkey-normal`.
-AtlasNet cluster data lives in the separate service on port `46380`.
-If terrain obstructs the configured placement, the Minecraft shard raises the
-player to the surface.
-
-Superflat terrain uses port `46381` and `run/minecraft-valkey`. To switch to
-superflat, set `MINECRAFT_TERRAIN_PRESET=flat` for the AtlasNet nodes and
-the Minecraft Valkey startup command in the stack's `preLaunchCommand`.
-The launcher defaults to normal terrain and respects that environment override.
-
-The repeatable migration test builds the demo and uses the real Stack Tool
-configuration generator, two shard workers, and two graphical Fabric clients:
+The default CMake target, `atlasnet-sdk`, runs one Gradle build for the API
+projects, the ingress scaffolds, and the examples. The wrapper also works directly:
 
 ```sh
-python3 tests/integration/migration.py --seconds 90 --label walking
+./gradlew :atlasnet-plugin:build
+./gradlew :atlasnet-endpoint:build
+./gradlew :atlasnet-admissionHandler:build
+./gradlew :atlasnet-spawnResolver:build
+./gradlew :atlasnet-mod:client:build
+./gradlew :atlasnet-mod:server:build
+./gradlew build
 ```
 
-Run it from the repository root in a graphical session with JDK 21 and the
-AtlasNet submodule initialized and `VCPKG_ROOT` set. It builds the required
-AtlasNet targets itself and uses isolated Valkey data and ingress ports
-`5971` and `5972`. The first client walks between x=-32 and x=32 while the
-second watches. It records shard UUID changes, position corrections, observer
-continuity, loading screens, client tick gaps, and slow server ticks under
-`build/migration-test/walking/`. `MIGRATION_BATCH=400ms` repeats the test with
-delayed transfer batches. The optional `-PatlasnetMigrationTest` mod supplies
-real key input and measurement hooks; it is excluded from normal builds. The
-runner restores the normal shard launch configuration when it finishes.
-Screenshots in each client's `screenshots/` folder capture the first confirmed
-handoff; the observer also enables the region boundary overlay.
+| CMake target | Artifact relative to the repository root |
+| --- | --- |
+| `atlasnet-plugin` | `atlasnet-plugin/build/libs/atlasnet-plugin.jar` |
+| `atlasnet-endpoint` | `atlasnet-endpoint/build/libs/atlasnet-endpoint.jar` |
+| `atlasnet-admissionHandler` | `atlasnet-admissionHandler/build/libs/atlasnet-admissionHandler.jar` |
+| `atlasnet-spawnResolver` | `atlasnet-spawnResolver/build/libs/atlasnet-spawnResolver.jar` |
+| `atlasnet-mod-client` | `atlasnet-mod/client/build/libs/atlasnet-mod-client.jar` |
+| `atlasnet-mod-server` | `atlasnet-mod/server/build/libs/atlasnet-mod-server.jar` |
+| `example-plugin` | `examples/plugin/build/libs/atlasnet-plugin-example.jar` |
+| `example-mod-client` | `examples/mod/client/build/libs/atlasnet-mod-client-example.jar` |
+| `example-mod-server` | `examples/mod/server/build/libs/atlasnet-mod-server-example.jar` |
 
-Validated locally on 2026-11-17 with two actual Fabric clients connected to
-separate SteamNetSock ingress sockets and walking repeatedly between x=-32
-and x=32 in superflat. Both 90-second runs passed: `final-walking` used the
-saved 50 ms transfer batch, and `final-batched` used 400 ms. Each recorded six
-actual shard UUID changes, zero position corrections, zero backward steps in
-either view, zero missing/recreated remote players, zero boundary stalls, and
-zero loading screens or world replacements. Neither server logged a tick over
-100 ms or a tick gap over 150 ms during measurement. Client tick gaps peaked
-below 66 ms. Reports and screenshots are under `build/migration-test/`.
-The shared protocol codec checks and Fabric checks also passed.
-An additional 35-second, 400 ms batch run (`final-recovery`) completed three
-migrations and verified reliable resting-pose recovery after deliberately
-omitting updates on the observer. Repeat that check with `--verify-settled`.
+The common JARs are
+`common/core/build/libs/atlasnet-minecraft-core.jar` and
+`common/mod/build/libs/atlasnet-minecraft-mod-common.jar`. Build them directly
+with `./gradlew :common:core:build :common:mod:build`. Gradle exports the SDK
+dependencies used by public contracts. For a manual classpath, supply each
+upstream JAR shown in the [dependency graph](docs/architecture.md#module-dependencies).
 
-Run `./gradlew :fabric:chunkStorageTest` against an isolated Minecraft Valkey
-with a fresh data directory. After stopping and starting that test instance,
-run `./gradlew :fabric:chunkStorageTest --args=verify-restart` to check recovery
-of both NBT and ownership metadata. The task also accepts
-`--args="verify-region /path/to/r.0.0.mca"` for a real generated chunk.
+The JARs are libraries for compiling extensions. Installable Paper, Fabric, and
+NeoForge artifacts will come from future platform-specific packaging.
