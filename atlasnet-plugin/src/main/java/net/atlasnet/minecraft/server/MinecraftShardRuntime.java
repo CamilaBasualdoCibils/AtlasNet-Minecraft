@@ -10,6 +10,7 @@ import java.util.concurrent.CompletableFuture;
 import net.minecraft.SharedConstants;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.server.Eula;
 import net.minecraft.server.MinecraftServer;
@@ -21,9 +22,11 @@ import net.minecraft.server.dedicated.DedicatedServerSettings;
 import net.minecraft.server.level.progress.LoggerChunkProgressListener;
 import net.minecraft.server.network.ServerConnectionListener;
 import net.minecraft.server.packs.repository.ServerPacksSource;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.datafix.DataFixers;
 import net.minecraft.world.flag.FeatureFlags;
 import net.minecraft.world.level.GameRules;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LevelSettings;
 import net.minecraft.world.level.WorldDataConfiguration;
 import net.minecraft.world.level.storage.LevelStorageSource;
@@ -41,6 +44,11 @@ public final class MinecraftShardRuntime implements AutoCloseable {
     }
 
     public static MinecraftShardRuntime start(Path directory, Shard shard) throws IOException {
+        return start(directory, shard, null);
+    }
+
+    public static MinecraftShardRuntime start(Path directory, Shard shard,
+                                              MinecraftChunkSubscriptions subscriptions) throws IOException {
         Files.createDirectories(directory);
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
@@ -78,7 +86,7 @@ public final class MinecraftShardRuntime implements AutoCloseable {
                 var services = Services.create(new YggdrasilAuthenticationService(Proxy.NO_PROXY), directory.toFile());
                 var ready = new CompletableFuture<Void>();
                 var server = MinecraftServer.spin(thread -> new HostedServer(thread, storage, packs, world,
-                        settings, services, shard, ready));
+                        settings, services, shard, subscriptions, ready));
                 return new MinecraftShardRuntime(server, ready);
             } catch (RuntimeException failure) {
                 world.close();
@@ -102,16 +110,18 @@ public final class MinecraftShardRuntime implements AutoCloseable {
     private static final class HostedServer extends DedicatedServer {
         private final ServerConnectionListener atlasConnections;
         private final Shard shard;
+        private final MinecraftChunkSubscriptions subscriptions;
         private final CompletableFuture<Void> ready;
         private MinecraftShardBridge bridge;
 
         HostedServer(Thread thread, LevelStorageSource.LevelStorageAccess storage,
                      net.minecraft.server.packs.repository.PackRepository packs, WorldStem world,
                      DedicatedServerSettings settings, Services services, Shard shard,
-                     CompletableFuture<Void> ready) {
+                     MinecraftChunkSubscriptions subscriptions, CompletableFuture<Void> ready) {
             super(thread, storage, packs, world, settings, DataFixers.getDataFixer(), services,
                     LoggerChunkProgressListener::createFromGameruleRadius);
             this.shard = shard;
+            this.subscriptions = subscriptions;
             this.ready = ready;
             atlasConnections = new ServerConnectionListener(this) {
                 @Override
@@ -130,6 +140,20 @@ public final class MinecraftShardRuntime implements AutoCloseable {
         @Override
         public ServerConnectionListener getConnection() {
             return atlasConnections;
+        }
+
+        @Override
+        protected void createLevels(net.minecraft.server.level.progress.ChunkProgressListener progress) {
+            super.createLevels(progress);
+            if (subscriptions != null) {
+                for (var level : getAllLevels()) subscriptions.observe(level);
+            }
+        }
+
+        @Override
+        public ServerLevel getLevel(ResourceKey<Level> dimension) {
+            // Vanilla portals and dimension commands resolve their destinations here.
+            return Level.OVERWORLD.equals(dimension) ? super.getLevel(dimension) : null;
         }
 
         @Override

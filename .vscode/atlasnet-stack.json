@@ -1,0 +1,63 @@
+{
+  "program": "${workspaceFolder}/AtlasNet/build/AtlasNetNode",
+  "cwd": "${workspaceFolder}/build",
+  "preLaunchCommand": "\"${workspaceFolder}/scripts/minecraft-build.sh\" stack",
+  "gdb": "${workspaceFolder}/scripts/minecraft-gdb.sh",
+  "clusterPort": 42000,
+  "handshakePort": 43000,
+  "controlPanelPort": 8080,
+  "ignoreShutdownSignals": true,
+  "valgrind": false,
+  "valgrindProgram": "/usr/bin/valgrind",
+  "perf": false,
+  "perfProgram": "/usr/bin/perf",
+  "perfOutput": "${workspaceFolder}/build/perf-${index}.data",
+  "valkeyURI": "tcp://127.0.0.1:46379",
+  "launchValkey": true,
+  "valkeyProgram": "${workspaceFolder}/AtlasNet/build/_deps/valkey-src/src/valkey-server",
+  "initializeCluster": true,
+  "clusterMode": "direct",
+  "clusterConfigPath": "",
+  "clusterSettings": {
+    "controller": {
+      "heuristic": "atlasnet.kdtree2d"
+    },
+    "spatialPlane": "XZ"
+  },
+  "groups": [
+    {
+      "name": "Minecraft",
+      "count": 1,
+      "capabilities": [
+        "Database",
+        "Shard",
+        "ControllerEligible",
+        "ClientIngress"
+      ],
+      "args": [],
+      "nodeMode": "direct",
+      "nodeConfigPath": "",
+      "nodeSettings": {
+        "shards": {
+          "max_count": 1,
+          "cpu_request": 2,
+          "memory_request": "512MiB",
+          "worker_executable": ""
+        },
+        "modules": [
+          "${workspaceFolder}/build/host/libatlasnet-minecraft-shard.so",
+          "${workspaceFolder}/build/host/libatlasnet-minecraft-endpoint.so",
+          "${workspaceFolder}/build/host/libatlasnet-minecraft-admission.so",
+          "${workspaceFolder}/build/host/libatlasnet-minecraft-spawn.so"
+        ],
+        "ingress-listeners": [],
+        "ingress-endpoints": [
+          {
+            "id": "minecraft-1",
+            "name": "minecraft"
+          }
+        ]
+      }
+    }
+  ]
+}
