@@ -43,10 +43,6 @@ final class MinecraftServerProperties {
     static DedicatedServerProperties vanilla(Properties settings) {
         net.minecraft.SharedConstants.tryDetectVersion();
         net.minecraft.server.Bootstrap.bootStrap();
-        var vanilla = new DedicatedServerProperties((Properties) settings.clone());
-        if (!vanilla.onlineMode) {
-            throw new IllegalArgumentException("Minecraft ingress requires online-mode=true");
-        }
-        return vanilla;
+        return new DedicatedServerProperties((Properties) settings.clone());
     }
 }

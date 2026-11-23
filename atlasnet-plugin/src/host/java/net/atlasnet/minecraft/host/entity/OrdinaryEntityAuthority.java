@@ -13,6 +13,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import io.netty.buffer.Unpooled;
+import net.atlasnet.minecraft.host.ChunkTerrainAuthority;
 import net.atlasnet.minecraft.sdk.core.MinecraftIngressPackets;
 import net.atlasnet.minecraft.server.MinecraftEntityLifecycle;
 import net.atlasnet.minecraft.server.MinecraftShardBridge;
@@ -51,11 +52,13 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
         String token = UUID.randomUUID().toString();
         Runnable startTicking, stopTicking;
         final double x, y, z;
+        net.minecraft.world.phys.Vec3 lastPosition;
         volatile boolean retired;
         volatile long id;
         volatile boolean claimed;
         volatile boolean shutdownRetiring;
         boolean active;
+        boolean publishingInitialState;
 
         Entry(Entity entity) {
             uuid = entity.getUUID();
@@ -63,6 +66,7 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
             x = entity.getX();
             y = entity.getY();
             z = entity.getZ();
+            lastPosition = entity.position();
         }
     }
 
@@ -116,6 +120,8 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
     private final PlayerEntityPublication publication;
     private final IdentityHashMap<Entity, Entry> tracked = new IdentityHashMap<>();
     private final ConcurrentLinkedQueue<Runnable> actions = new ConcurrentLinkedQueue<>();
+    private final java.util.concurrent.ConcurrentHashMap<Entry, net.minecraft.world.phys.Vec3> transforms =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.HashSet<Entry> reservations = new java.util.HashSet<>();
     private boolean stopping;
     private int ticks;
@@ -127,6 +133,7 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
         shard.onShutdown(() -> {
             stopping = true;
             actions.clear();
+            transforms.clear();
         });
         shard.onPoll(() -> {
             for (int i = 0; i < 256; i++) {
@@ -134,6 +141,18 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
                 if (action == null) break;
                 action.run();
             }
+            transforms.forEach((entry, position) -> {
+                if (entry.retired) {
+                    transforms.remove(entry, position);
+                    return;
+                }
+                try {
+                    shard.updateEntityTransform(entry.id, transform(position.x, position.y, position.z));
+                    transforms.remove(entry, position);
+                } catch (GErrorException failure) {
+                    log(entry, failure);
+                }
+            });
         });
     }
 
@@ -227,19 +246,48 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
                     return;
                 }
             }
-            entry.active = true;
-            entry.startTicking.run();
+            AtlasNetEntityStore.Snapshot initial;
+            try {
+                initial = AtlasNetEntityStore.Snapshot.capture(entry.id, 1, 1, entity);
+            } catch (RuntimeException failureToCapture) {
+                log(entry, failureToCapture);
+                trackingEnded(entity);
+                return;
+            }
+            entry.publishingInitialState = true;
+            actions.add(() -> publication.initialize(initial).thenAccept(published -> server.execute(() -> {
+                if (tracked.get(entity) != entry || entry.retired) return;
+                if (!published) {
+                    trackingEnded(entity);
+                    return;
+                }
+                entry.active = true;
+                entry.startTicking.run();
+            })));
         }));
     }
 
     /** Bind AtlasNet's existing callbacks on the worker. Staged entities stay outside the live level. */
     public void registerTransfers(MinecraftServer server, MinecraftShardBridge bridge) {
+        registerTransfers(server, bridge, null);
+    }
+
+    public void registerTransfers(MinecraftServer server, MinecraftShardBridge bridge,
+                                  ChunkTerrainAuthority terrain) {
         shard.onPrepareExtract((id, transfer) -> {
+            if (terrain != null && terrain.owns(id)) return terrain.prepareExtract(id);
             var player = preparePlayerExtract(server, bridge, id);
             return player == null ? prepareExtract(server, id) : player;
         });
-        shard.onPrepareRestore((id, transfer, data) -> prepareRestore(server, bridge, id, data));
+        shard.onPrepareRestore((id, transfer, data) -> {
+            if (terrain != null) {
+                var prepared = terrain.prepareRestore(id, data);
+                if (prepared.isPresent()) return prepared.get();
+            }
+            return prepareRestore(server, bridge, id, data);
+        });
         shard.onCommitExtract((id, transfer) -> {
+            if (terrain != null && terrain.owns(id)) return terrain.commitExtract(id);
             var player = outgoingPlayers.get(id);
             if (player != null) {
                 server.submit(() -> {
@@ -267,13 +315,20 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
             outgoing.remove(id);
             return true;
         });
-        shard.onCommitRestore((id, transfer) -> incomingPlayers.containsKey(id)
-                ? commitPlayerRestore(server, bridge, id) : commitRestore(server, id));
+        shard.onCommitRestore((id, transfer) -> {
+            if (terrain != null && terrain.hasIncoming(id)) return terrain.commitRestore(id);
+            return incomingPlayers.containsKey(id) ? commitPlayerRestore(server, bridge, id) : commitRestore(server, id);
+        });
         shard.onAbortExtract((id, transfer) -> {
+            if (terrain != null && terrain.owns(id)) {
+                terrain.abortExtract(id);
+                return;
+            }
             unfreezePlayer(server, bridge, id);
             unfreeze(server, id);
         });
         shard.onAbortRestore((id, transfer) -> {
+            if (terrain != null) terrain.abortRestore(id);
             incomingPlayers.remove(id);
             incoming.remove(id);
         });
@@ -305,6 +360,10 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
                     var peer = ByteBuffer.allocate(19);
                     MinecraftIngressPackets.writePeer(peer, metadata.peer()).flip();
                     bytes.writeBytes(peer);
+                    bytes.writeUtf(metadata.observer().interest());
+                    bytes.writeVarInt(metadata.observer().visiblePlayers().size());
+                    metadata.observer().visiblePlayers().forEach((entity, uuid) ->
+                            bytes.writeLong(entity).writeUUID(uuid));
                     var result = new ByteArrayOutputStream();
                     try (var output = new DataOutputStream(result)) {
                         output.writeUTF("");
@@ -349,8 +408,21 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
             var information = new ClientInformation(bytes);
             var peer = bytes.nioBuffer();
             InetSocketAddress address = MinecraftIngressPackets.readPeer(peer);
-            if (peer.hasRemaining() || profile.getId() == null || playId >= -1) return false;
-            metadata = new MinecraftShardBridge.PlayerTransfer(client, playId, profile, information, address);
+            bytes.skipBytes(peer.position());
+            if (profile.getId() == null || playId >= -1) return false;
+            var observer = MinecraftShardBridge.ObserverState.EMPTY;
+            if (bytes.isReadable()) {
+                String interest = bytes.readUtf();
+                int count = bytes.readVarInt();
+                if (count < 0 || count > bytes.readableBytes() / 24 || bytes.readableBytes() != count * 24)
+                    return false;
+                var avatars = new java.util.HashMap<Long, UUID>();
+                for (int i = 0; i < count; i++) {
+                    if (avatars.put(bytes.readLong(), bytes.readUUID()) != null) return false;
+                }
+                observer = new MinecraftShardBridge.ObserverState(interest, avatars);
+            }
+            metadata = new MinecraftShardBridge.PlayerTransfer(client, playId, profile, information, address, observer);
         } finally {
             bytes.release();
         }
@@ -375,7 +447,7 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
                 player.publication = null;
                 return false;
             }
-            if (!server.submit(() -> bridge.stagePlayer(id, player.metadata, player.snapshot.data())).join())
+            if (!server.submit(() -> bridge.restorePlayer(id, player.metadata, player.snapshot.data())).join())
                 return false;
             incomingPlayers.remove(id);
             return true;
@@ -543,11 +615,16 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
         var entry = tracked.remove(entity);
         if (entry == null) return;
         entry.retired = true;
+        transforms.remove(entry);
         if (entry.shutdownRetiring) return;
         if (entry.active) {
             publication.capture(entry.id, entity);
             var reason = entity.getRemovalReason();
             publication.retire(entry.id, reason != null && reason.shouldDestroy(), () -> unregister(entry));
+        } else if (entry.publishingInitialState) {
+            var reason = entity.getRemovalReason();
+            boolean deleted = reason != null && reason.shouldDestroy();
+            actions.add(() -> publication.retire(entry.id, deleted, () -> unregister(entry)));
         } else {
             actions.add(() -> unregister(entry));
         }
@@ -566,16 +643,15 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
     @Override public void destroyed(Entity entity) { trackingEnded(entity); }
 
     @Override public void tick() {
-        if (++ticks % 20 != 0) return;
+        boolean capture = ++ticks % 20 == 0;
         tracked.forEach((entity, entry) -> {
             if (!entry.active || entry.retired) return;
-            publication.capture(entry.id, entity);
-            double x = entity.getX(), y = entity.getY(), z = entity.getZ();
-            actions.add(() -> {
-                if (entry.retired) return;
-                try { shard.updateEntityTransform(entry.id, transform(x, y, z)); }
-                catch (GErrorException failure) { log(entry, failure); }
-            });
+            if (capture) publication.capture(entry.id, entity);
+            var position = entity.position();
+            if (!position.equals(entry.lastPosition)) {
+                entry.lastPosition = position;
+                transforms.put(entry, position);
+            }
         });
     }
 

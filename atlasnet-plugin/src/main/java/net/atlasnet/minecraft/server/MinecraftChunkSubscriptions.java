@@ -28,14 +28,26 @@ public final class MinecraftChunkSubscriptions {
         boolean desired;
         boolean present;
         boolean inFlight;
+        boolean accessible;
     }
 
     private final ConcurrentLinkedQueue<Change> changes = new ConcurrentLinkedQueue<>();
     private final HashMap<Chunk, Membership> memberships = new HashMap<>();
     private final StateStore store;
     private final Variant shardId;
+    private final ChunkLifecycle lifecycle;
+
+    @FunctionalInterface
+    public interface ChunkLifecycle {
+        void accessibilityChanged(ResourceLocation dimension, int x, int z, boolean loaded);
+    }
 
     public MinecraftChunkSubscriptions(Shard shard, UUID id) throws GErrorException {
+        this(shard, id, (dimension, x, z, loaded) -> {});
+    }
+
+    public MinecraftChunkSubscriptions(Shard shard, UUID id, ChunkLifecycle lifecycle) throws GErrorException {
+        this.lifecycle = lifecycle;
         store = shard.getStateStore("minecraft.chunks");
         shardId = Variant.string(id.toString());
         shard.onPoll(this::poll);
@@ -65,6 +77,7 @@ public final class MinecraftChunkSubscriptions {
         for (Change change; (change = changes.poll()) != null;) {
             var membership = memberships.computeIfAbsent(change.chunk(), ignored -> new Membership());
             membership.desired = change.loaded();
+            if (!membership.desired) notifyAccessibility(change.chunk(), membership, false);
             reconcile(change.chunk(), membership);
         }
     }
@@ -88,6 +101,7 @@ public final class MinecraftChunkSubscriptions {
     private void reconcile(Chunk chunk, Membership membership) {
         if (membership.inFlight) return;
         if (membership.desired == membership.present) {
+            if (membership.present) notifyAccessibility(chunk, membership, true);
             if (!membership.present) memberships.remove(chunk);
             return;
         }
@@ -105,6 +119,12 @@ public final class MinecraftChunkSubscriptions {
         } catch (GErrorException failure) {
             LOG.log(System.Logger.Level.WARNING, "Could not open chunk subscribers for " + chunk.key(), failure);
         }
+    }
+
+    private void notifyAccessibility(Chunk chunk, Membership membership, boolean accessible) {
+        if (membership.accessible == accessible) return;
+        membership.accessible = accessible;
+        lifecycle.accessibilityChanged(chunk.dimension(), chunk.x(), chunk.z(), accessible);
     }
 
     private void finish(Chunk chunk, Membership membership, boolean add, StoreFinish finish) {

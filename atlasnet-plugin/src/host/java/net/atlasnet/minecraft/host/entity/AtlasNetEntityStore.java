@@ -38,9 +38,17 @@ public final class AtlasNetEntityStore {
 
         /** Capture on the Minecraft server thread while this worker owns the entity. */
         public static Snapshot capture(long entityId, long generation, long revision, Entity entity) {
+            var data = entity.saveWithoutId(new CompoundTag());
+            if (entity instanceof net.minecraft.server.level.ServerPlayer player) {
+                data.putString("AtlasNetProfileName", player.getGameProfile().getName());
+                var metadata = net.atlasnet.minecraft.server.MinecraftShardBridge.PlayerMetadataState.capture(player);
+                data.putByte("AtlasNetLivingFlags", metadata.livingFlags());
+                data.putByte("AtlasNetSharedFlags", metadata.sharedFlags());
+                data.putInt("AtlasNetPose", metadata.pose().ordinal());
+            }
             return new Snapshot(entityId, generation, revision, entity.getUUID(),
                     BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString(),
-                    entity.level().dimension().location().toString(), entity.saveWithoutId(new CompoundTag()));
+                    entity.level().dimension().location().toString(), data);
         }
     }
 

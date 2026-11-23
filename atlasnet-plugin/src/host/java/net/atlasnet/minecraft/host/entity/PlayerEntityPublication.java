@@ -7,6 +7,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.time.Duration;
+import net.atlasnet.minecraft.server.terrain.TerrainStore;
 import net.minecraft.world.entity.Entity;
 import org.atlasnet.atlasnet.Shard;
 import org.javagi.base.GErrorException;
@@ -18,6 +19,8 @@ public final class PlayerEntityPublication {
     private static final long WRITE_RETRY_NANOS = java.time.Duration.ofMillis(250).toNanos();
 
     private record Change(AtlasNetEntityStore.Snapshot snapshot, boolean retired, boolean deleted, Runnable afterRetire) {}
+    private record Settlement(TerrainStore.Reservation reservation, AtlasNetEntityStore.Snapshot sample,
+                              CompletableFuture<Boolean> result) {}
 
     private static final class Publication {
         AtlasNetEntityStore.Published last;
@@ -30,11 +33,14 @@ public final class PlayerEntityPublication {
         long checkpointedRevision;
         long checkpointDue;
         long retryDue;
+        long settlementRetryDue;
         volatile long durableGeneration;
+        long durableRevision;
         boolean checkpointInFlight;
         boolean checkpointedDeletion;
         boolean checkpointFailed;
         Runnable afterRetire;
+        CompletableFuture<Boolean> initialPublication;
     }
 
     private final AtlasNetEntityStore store;
@@ -46,6 +52,7 @@ public final class PlayerEntityPublication {
     private final ConcurrentHashMap<Long, Runnable> checkpointCompletions = new ConcurrentHashMap<>();
     // Coalesce game-thread samples before handing them to the worker.
     private final ConcurrentHashMap<Long, Change> changes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, Settlement> settlements = new ConcurrentHashMap<>();
     private final HashMap<Long, Publication> players = new HashMap<>();
     private final HashSet<Long> retrying = new HashSet<>();
     private final HashSet<Long> adopting = new HashSet<>();
@@ -103,6 +110,31 @@ public final class PlayerEntityPublication {
         }
     }
 
+    /** Establish the first migration revision before activating simulation. Call on the worker. */
+    CompletableFuture<Boolean> initialize(AtlasNetEntityStore.Snapshot snapshot) {
+        long entity = snapshot.entityId();
+        var publication = players.computeIfAbsent(entity, ignored -> new Publication());
+        var ready = new CompletableFuture<Boolean>();
+        publication.initialPublication = ready;
+        publication.desired = snapshot;
+        advance(entity, publication);
+        return ready;
+    }
+
+    /** Capture confirmed player state on the Minecraft thread and settle it on the checkpoint executor. */
+    public CompletableFuture<Boolean> settleTerrain(long entity, Entity player, TerrainStore.Reservation reservation) {
+        AtlasNetEntityStore.Snapshot snapshot;
+        try {
+            snapshot = AtlasNetEntityStore.Snapshot.capture(entity, 1, 1, player);
+        } catch (RuntimeException failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+        var settlement = new Settlement(reservation, snapshot, new CompletableFuture<>());
+        if (settlements.putIfAbsent(entity, settlement) != null) return CompletableFuture.completedFuture(false);
+        changes.put(entity, new Change(snapshot, false, false, null));
+        return settlement.result();
+    }
+
     public void retire(long entity) {
         retire(entity, false, null);
     }
@@ -116,7 +148,8 @@ public final class PlayerEntityPublication {
     AtlasNetEntityStore.Snapshot freeze(long entity, AtlasNetEntityStore.Snapshot finalState) {
         var publication = players.get(entity);
         if (publication == null || publication.last == null || publication.busy ||
-                publication.checkpointInFlight || publication.retryDue != 0 || publication.retired || publication.lostOwnership)
+                publication.checkpointInFlight || settlements.containsKey(entity) ||
+                publication.retryDue != 0 || publication.retired || publication.lostOwnership)
             return null;
         publication.frozen = true;
         changes.remove(entity);
@@ -204,19 +237,36 @@ public final class PlayerEntityPublication {
     }
 
     private void scheduleCheckpoint(long entity, Publication publication) {
+        var settlement = settlements.get(entity);
+        if (settlement != null && publication.lostOwnership) {
+            if (settlements.remove(entity, settlement)) settlement.result().complete(false);
+            settlement = null;
+        }
         if (publication.frozen || publication.lostOwnership || publication.checkpointInFlight) return;
         var snapshot = checkpointSnapshot(entity, publication);
         boolean deleted = publication.deleted;
-        if (!needsCheckpoint(publication, snapshot) ||
+        if (settlement != null) {
+            if (snapshot == null ||
+                    (publication.settlementRetryDue != 0 &&
+                            System.nanoTime() - publication.settlementRetryDue < 0)) return;
+        } else if (!needsCheckpoint(publication, snapshot) ||
                 ((!publication.retired || publication.checkpointFailed) &&
                         System.nanoTime() < publication.checkpointDue)) return;
+        var request = settlement;
+        var checkpoint = request == null ? snapshot : new AtlasNetEntityStore.Snapshot(
+                entity, snapshot.ownershipGeneration(), snapshot.revision(), snapshot.minecraftId(),
+                snapshot.entityType(), request.sample().dimension(), request.sample().data());
+        long revision = Math.max(Math.addExact(snapshot.revision(), deleted ? 2 : 1),
+                Math.addExact(publication.durableRevision, 1));
         publication.checkpointInFlight = true;
         checkpointIo.execute(() -> {
             boolean written = false;
             try {
                 if (publication.durableGeneration == 0) publication.durableGeneration = checkpoints.claim(snapshot);
-                written = checkpoints.checkpointClaimed(snapshot, publication.durableGeneration,
-                        Math.addExact(snapshot.revision(), deleted ? 2 : 1), deleted);
+                written = request == null
+                        ? checkpoints.checkpointClaimed(snapshot, publication.durableGeneration, revision, deleted)
+                        : checkpoints.checkpointInteraction(checkpoint, publication.durableGeneration, revision,
+                                request.reservation());
             } catch (Exception failure) {
                 logFailure(entity, failure);
             }
@@ -225,8 +275,15 @@ public final class PlayerEntityPublication {
                 publication.checkpointInFlight = false;
                 publication.checkpointFailed = !saved;
                 if (saved) {
-                    publication.checkpointedRevision = snapshot.revision();
-                    publication.checkpointedDeletion = deleted;
+                    publication.durableRevision = revision;
+                    if (!differs(snapshot, checkpoint)) {
+                        publication.checkpointedRevision = snapshot.revision();
+                        publication.checkpointedDeletion = deleted;
+                    }
+                }
+                if (request != null) {
+                    publication.settlementRetryDue = saved ? 0 : System.nanoTime() + WRITE_RETRY_NANOS;
+                    if (saved && settlements.remove(entity, request)) request.result().complete(true);
                 }
                 publication.checkpointDue = System.nanoTime() + checkpointInterval;
                 if (publication.retired) advance(entity, publication);
@@ -264,6 +321,10 @@ public final class PlayerEntityPublication {
         boolean changed = differs(last, sample);
         if (publication.retired && (!changed || publication.lostOwnership)) {
             if (publication.checkpointInFlight) return;
+            if (settlements.containsKey(entity)) {
+                scheduleCheckpoint(entity, publication);
+                if (settlements.containsKey(entity)) return;
+            }
             if (needsCheckpoint(publication, last)) {
                 scheduleCheckpoint(entity, publication);
                 return;
@@ -299,6 +360,10 @@ public final class PlayerEntityPublication {
             else {
                 if (publication.last == null) publication.checkpointDue = System.nanoTime() + checkpointInterval;
                 publication.last = written.get();
+            }
+            if (publication.initialPublication != null) {
+                publication.initialPublication.complete(!publication.lostOwnership);
+                publication.initialPublication = null;
             }
             if (publication.retired || (failure == null && publication.desired != sample)) {
                 advance(entity, publication);

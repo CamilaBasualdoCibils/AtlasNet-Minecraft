@@ -86,14 +86,21 @@ public final class MinecraftTcpEndpoint {
                 }
                 // Client V1 Signal fields precede the original payload, in Bitsery little-endian order.
                 var signal = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
-                if (signal.remaining() < 12 || signal.getInt() != PLAY_PACKET_SIGNAL) {
+                if (signal.remaining() < 12) {
                     return ClientDispatchResult.FAILED;
                 }
+                int kind = signal.getInt();
                 signal.getInt(); // AtlasNet signal instance number
                 if (signal.getInt() != signal.remaining() || !signal.hasRemaining()) {
                     return ClientDispatchResult.FAILED;
                 }
-                return peer.offer(new Output(false, Arrays.copyOfRange(payload, 12, payload.length)));
+                if (kind == MinecraftIngressPackets.PLAYER_ACTIVITY_SIGNAL) {
+                    if (signal.remaining() <= Long.BYTES) return ClientDispatchResult.FAILED;
+                    if (signal.getLong() == id) return ClientDispatchResult.SENT;
+                } else if (kind != PLAY_PACKET_SIGNAL) {
+                    return ClientDispatchResult.FAILED;
+                }
+                return peer.offer(new Output(false, Arrays.copyOfRange(payload, signal.position(), payload.length)));
             });
         }
 

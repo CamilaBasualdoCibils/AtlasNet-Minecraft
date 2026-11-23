@@ -1,7 +1,7 @@
 # AtlasNet ingress modules
 
 These projects use the AtlasNet Module Java SDK. The admission module implements
-Minecraft 1.21.1 online-mode Login and Configuration. The spawn resolver exposes
+Minecraft 1.21.1 Login and Configuration, with online mode by default. The spawn resolver exposes
 registration for a configured initial placement. The Minecraft JVM host registers the providers, including the Java TCP endpoint.
 
 | Project | Execution context | Existing AtlasNet binding |
@@ -48,9 +48,11 @@ client's acknowledgement of Finish Configuration completes admission.
 
 A module host can register `MinecraftSpawnResolver.DEFAULT` for the
 temporary AtlasNet placement `minecraft:overworld` at `(0, 150, 0)`, or
-construct the resolver with a different configured placement. AtlasNet uses that placement to select the shard.
-The resolver performs no Minecraft world I/O. The shard uses vanilla player
-placement, including saved positions for returning players.
+construct the resolver with a different configured placement. The JVM host
+uses a returning player's admission checkpoint for initial shard selection
+when it supplies a position. The shard restores that checkpoint in vanilla.
+For a new player, the shard passes the configured placement to vanilla.
+The resolver reads the admission payload without doing Minecraft world I/O.
 
 AtlasNet currently loads native modules through `AtlasNetGetModule`. Its Java
 SDK exposes the registry but does not supply JVM startup, Java JAR discovery,
@@ -105,7 +107,7 @@ the final AtlasNet callback confirms the spawn. A success carries the verified
 `ByteBufCodecs.GAME_PROFILE` value followed by the vanilla
 `ClientInformation.write` value and the same trusted peer metadata in
 `AdmissionResult.data`. The shard can use
-these to initialize the authenticated player without replaying Login or
+these to initialize the admitted player without replaying Login or
 Configuration. In the worker, `MinecraftPlayerJoin.place` checks vanilla
 player-list admission rules and calls `PlayerList.placeNewPlayer` on the server
 thread. Vanilla installs its original `ServerGamePacketListenerImpl` on the
@@ -139,9 +141,8 @@ from `build/host` in the Node's `modules` setting. The modules register
 through the standard AtlasNet module entry point and share a JVM per process.
 Shard-only Nodes need only the shard module. The group runs one Node
 with Database, ControllerEligible, Shard, and ClientIngress capabilities.
-The entity acceptance profile requests two Minecraft shards and creates a
-separate superflat world named `entity-acceptance` from the same seed on
-both workers. It loads the `example.xsplit2d` module so authority crosses
+The acceptance profile requests two Minecraft shards for one PostgreSQL-backed
+superflat world named `entity-acceptance`. It loads the `example.xsplit2d` module so authority crosses
 the X=0 plane, subject to AtlasNet's hysteresis. The loopback Control Panel
 can verify the player retains one AtlasNet EntityID while its shard changes.
 Existing `world` directories and their checkpoints are preserved. It uses managed Valkey and the `minecraft` ingress endpoint.
@@ -179,6 +180,116 @@ stop shard-only Nodes while the Database Node is still available. An unexpected
 process exit or an unavailable StateStore during shutdown can leave stale members.
 A future cleanup task can use the AtlasNet shard registry to remove members
 whose shard instances have expired.
+
+### Terrain integration testing
+
+For a local two-client run, set `minecraft.server-properties.online-mode` to
+`false` in the isolated profile and choose two distinct offline usernames.
+The admission handler accepts offline identities only over loopback and derives
+each UUID from its username using vanilla's offline profile algorithm. The
+checked-in profile uses online mode.
+
+The checked-in Run Stack profile sets
+`clusterSettings.application.minecraft.terrain-enabled` to `true` for
+PostgreSQL chunk I/O and AtlasNet chunk write fences. This gates vanilla block changes and terrain
+ticks by local chunk authority. After PostgreSQL commits a revision, the
+worker uses the existing chunk subscriber set and ShardRPC to refresh loaded
+replicas. Replica block state and block-entity changes use vanilla's chunk
+update notifications. The publishing worker retries failed subscriber lookups
+and notice deliveries with bounded backoff. A failed replica refresh retries
+while the chunk remains subscribed. The Minecraft thread discards refreshes
+superseded by a newer request or a subscription change. The worker saves changes to vanilla block
+and fluid tick queues. Authority activation restores those queues from the
+committed chunk before enabling terrain simulation. A local two-shard test
+with offline protocol clients verified creative edits across the X=0 split,
+including a placement against a block face in the neighboring shard, and
+confirmed that the second client received the corresponding block update.
+With immediate transfers and zero hysteresis, the same two-shard regression
+also verified that a queued break waits for a failed player checkpoint to
+recover and that losing the first committed RPC reply adds no duplicate
+terrain receipt.
+After restarting the stock node with two new shard workers, fresh world
+directories, and an empty Valkey instance, a newly connected offline client
+received both committed blocks at X=-1 and X=0 in vanilla chunk packets.
+The profile reads terrain from PostgreSQL and generates missing chunks.
+Edits saved only in a worker's local world files before shared terrain was
+enabled require a separate import.
+
+If a PostgreSQL connection loses a save reply, the shard checks the stored
+revision, chunk NBT, and authority fence before retrying. An already committed
+snapshot keeps its original revision. A newer edit can then use that revision
+as its write base.
+
+For ordinary creative block placement and breaking on a remote chunk, the experimental
+profile routes a point SpatialRPC to the chunk region, checks the write fence
+on its Minecraft game thread, and executes vanilla `BlockItem.place` or
+`ServerPlayerGameMode.destroyBlock`. For ordinary single-block placement,
+the destination is the chunk that will contain the new block, which can differ
+from the chunk containing the clicked face.
+If the owner has unloaded the target chunk, it requests a full chunk load
+through vanilla's asynchronous entry point and rechecks authority on the
+Minecraft thread before executing the edit.
+The source sends the client's block correction and acknowledgment when the
+destination returns the result after saving. PostgreSQL records the response
+and terrain revision in the same transaction. Duplicate request IDs can
+reuse the recorded response. The chunk owner can also record a definitive
+rejection without changing the terrain revision. When a reply is missing,
+the source asks the owner to settle the same request ID. The owner reuses an
+existing receipt, waits for execution already in flight, or records a no-op
+for an action it never started. A failed interaction write retries with its
+original receipt. Later terrain writes and authority handoff wait for that
+transaction, and later player interactions wait for a confirmed result.
+A durable per-player request record also prevents a new session from
+starting a second remote edit before the previous request is settled.
+The shard begins recovery when AtlasNet attaches the player. It reads the
+existing reservation without creating one and queues block interaction packets
+until any earlier creative edit is settled.
+If the reservation write fails, the source retries with the same request ID
+and holds later interactions behind it. If routing returns without a result,
+the source retries the original RPC under that request ID before settling.
+The source keeps its packet queue
+with the attached player instance so a callback from a detached session
+cannot remove a replacement session's queue.
+The source acknowledges handling the result before PostgreSQL releases the
+reservation. A late acknowledgment leaves a newer reservation intact.
+For a confirmed edit on the live player, the shard uses the player checkpoint
+queue to commit the fenced checkpoint and release the terrain reservation in
+one PostgreSQL transaction. Failed settlements retain their place in the queue.
+A reservation can carry
+immutable vanilla NBT for recovering player effects. PostgreSQL retains that
+state until settlement runs with a player checkpoint, even when the terrain
+receipt already exists. The survival interaction path still needs to supply
+and recover this state. Interactable blocks and operations that modify multiple
+chunks still need interaction handoff support.
+
+A container can currently open against a shard's loaded terrain replica.
+Vanilla binds that menu to the local block entity, so clicking its slots does
+not update the authoritative inventory. A two-client boundary test reproduced
+this after both clients received the same committed chest placement.
+
+The inventory backend can read vanilla container slots through EntityRPC.
+Persistent block inventories use the chunk EntityID from StateStore and the
+block's dimension and position. The receiving shard validates the active
+chunk fence and reads the loaded vanilla block entity on its game thread.
+Players and ordinary entities implementing vanilla `Container` use their
+own EntityIDs. Block entity data continues to persist with the chunk.
+Reads leave unopened loot tables deferred. Remote menu sessions, inventory
+mutations, and transfers between inventory owners still need implementation.
+
+Player visibility sends initial Play packets directly from the saved profile,
+rotation, inventory, and pose when Spatial Interest reports an entry. This
+keeps vanilla's UUID-indexed advancement tracker bound to the live player,
+which receives any recipe rewards triggered by its inventory changes.
+
+The X-split profile selects immediate region transfers with zero hysteresis.
+An ordinary entity publishes its first transferable snapshot before it starts
+ticking. This lets a fast entity transfer as it crosses the boundary, then
+continue its vanilla simulation on the destination. In the two-client test,
+an arrow launched at X=-5.5 transferred at X=0.44 with its velocity intact,
+and vanilla reduced the Survival target's health from 20 to 10 at X=5.5.
+This test covers that crossing and target placement. Shooter attribution
+across shards and collision along a path that spans both regions in a single
+tick still need verification.
 
 ### What Run Stack builds
 
@@ -270,8 +381,8 @@ after verifying the Minecraft profile. The shard supplies it to vanilla's
 player-data loader before the player joins. Vanilla player files remain the
 fallback for profiles with no checkpoint. A checkpoint can lag live state
 if a worker exits before its next write. During player transfer the
-destination attaches a restored player to the existing Play session after it
-receives the first command routed to the new owner. It preserves the vanilla
+destination attaches a restored player to the existing Play session during
+the migration commit. It preserves the vanilla
 player entity ID and suppresses the join and initial teleport packets.
 Both workers need matching terrain for the same coordinates to look and
 behave the same after a handoff.
@@ -317,6 +428,30 @@ Use an entity-attached Spatial Interest for persistent nearby-entity
 membership and existing enter/exit notifications across shards. Use a world
 interest for fixed regions. Read observed entity snapshots through
 `AtlasNetEntityStore` and route authoritative changes through EntityRPC.
+Spatial Interest controls the lifetime of one vanilla player representation,
+using the same Minecraft entity ID on either shard. The authoritative shard
+sends movement, look direction, and hand swings through AtlasNet
+`DispatchSignal` with a spatial audience. Nearby clients use that same
+delivery path regardless of which shard owns them. The endpoint skips the
+originating client, which already renders its own player.
+When the observer migrates, the Minecraft handoff carries the stable AtlasNet
+interest handle and the player entity IDs the client already sees. The
+destination rebinds the callback to the transferred membership and retains
+existing client representations for players still in view.
+The shard sends a cluster-wide Broadcast Signal for a real session join or
+leave. Internal worker attachment and detachment during migration stay silent.
+Player chat uses the same Broadcast audience after vanilla validates the
+incoming message. The relay applies the filter mask and emits vanilla
+server-delivered chat, which does not carry a player signature.
+AtlasNet retains ordered input during the freeze.
+Minecraft drains received packets in order on the game thread, limiting
+movement packets per tick so the accumulated input still goes through
+vanilla's usual movement checks.
+The checked-in profile puts both shard workers on one node. In the two-node
+test, the observer received continuous movement on the same player entity
+as the player crossed between nodes. The observer could then cross and keep
+the existing representation. Cross-node handoff requires matching AtlasNet
+builds and the same heuristic module on each node.
 A spatial EntityRPC selects matching authoritative entities for one call.
 SpatialRPC instead routes to the owners of intersecting regions, including
 regions without entities. Use Signals to deliver results to clients.

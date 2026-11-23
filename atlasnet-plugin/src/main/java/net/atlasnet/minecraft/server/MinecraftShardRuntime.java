@@ -7,6 +7,7 @@ import java.net.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
+import net.atlasnet.minecraft.server.terrain.MinecraftTerrainIO;
 import net.minecraft.SharedConstants;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.registries.Registries;
@@ -72,6 +73,15 @@ public final class MinecraftShardRuntime implements AutoCloseable {
                                               java.util.function.BiFunction<MinecraftServer, Shard,
                                                       MinecraftShardBridge> bridgeFactory,
                                               MinecraftEntityLifecycle.Observer entityObserver) throws IOException {
+        return start(directory, shard, subscriptions, properties, bridgeFactory, entityObserver, null);
+    }
+
+    public static MinecraftShardRuntime start(Path directory, Shard shard, MinecraftChunkSubscriptions subscriptions,
+                                              java.util.Properties properties,
+                                              java.util.function.BiFunction<MinecraftServer, Shard,
+                                                      MinecraftShardBridge> bridgeFactory,
+                                              MinecraftEntityLifecycle.Observer entityObserver,
+                                              MinecraftTerrainIO.Backend terrain) throws IOException {
         Files.createDirectories(directory);
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
@@ -123,7 +133,7 @@ public final class MinecraftShardRuntime implements AutoCloseable {
                 var services = Services.create(new YggdrasilAuthenticationService(Proxy.NO_PROXY), directory.toFile());
                 var ready = new CompletableFuture<Void>();
                 var server = MinecraftServer.spin(thread -> new HostedServer(thread, storage, packs, world,
-                        settings, services, shard, subscriptions, ready, bridgeFactory, entityObserver));
+                        settings, services, shard, subscriptions, ready, bridgeFactory, entityObserver, terrain));
                 return new MinecraftShardRuntime(server, ready);
             } catch (RuntimeException failure) {
                 world.close();
@@ -159,6 +169,7 @@ public final class MinecraftShardRuntime implements AutoCloseable {
         private final CompletableFuture<Void> stopped = new CompletableFuture<>();
         private MinecraftShardBridge bridge;
         private final MinecraftEntityLifecycle.Observer entityObserver;
+        private final MinecraftTerrainIO.Backend terrain;
         private final java.util.function.BiFunction<MinecraftServer, Shard, MinecraftShardBridge> bridgeFactory;
 
         HostedServer(Thread thread, LevelStorageSource.LevelStorageAccess storage,
@@ -166,7 +177,7 @@ public final class MinecraftShardRuntime implements AutoCloseable {
                      DedicatedServerSettings settings, Services services, Shard shard,
                      MinecraftChunkSubscriptions subscriptions, CompletableFuture<Void> ready,
                      java.util.function.BiFunction<MinecraftServer, Shard, MinecraftShardBridge> bridgeFactory,
-                     MinecraftEntityLifecycle.Observer entityObserver) {
+                     MinecraftEntityLifecycle.Observer entityObserver, MinecraftTerrainIO.Backend terrain) {
             super(thread, storage, packs, world, settings, DataFixers.getDataFixer(), services,
                     LoggerChunkProgressListener::createFromGameruleRadius);
             this.storage = storage;
@@ -175,6 +186,7 @@ public final class MinecraftShardRuntime implements AutoCloseable {
             this.ready = ready;
             this.bridgeFactory = bridgeFactory;
             this.entityObserver = entityObserver;
+            this.terrain = terrain;
             atlasConnections = new ServerConnectionListener(this) {
                 @Override
                 public void startTcpServerListener(InetAddress address, int port) {
@@ -199,6 +211,14 @@ public final class MinecraftShardRuntime implements AutoCloseable {
         protected void createLevels(net.minecraft.server.level.progress.ChunkProgressListener progress) {
             super.createLevels(progress);
             for (var level : getAllLevels()) {
+                if (terrain != null) {
+                    try {
+                        var dimensionPath = storage.getDimensionPath(level.dimension());
+                        MinecraftTerrainIO.install(level, dimensionPath.resolve("region"), storage.getLevelId(), terrain);
+                    } catch (IOException failure) {
+                        throw new java.io.UncheckedIOException(failure);
+                    }
+                }
                 if (subscriptions != null) subscriptions.observe(level);
                 if (entityObserver != null) MinecraftEntityLifecycle.install(level, entityObserver);
             }

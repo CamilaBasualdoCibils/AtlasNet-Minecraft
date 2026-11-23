@@ -3,6 +3,7 @@ package net.atlasnet.minecraft.host.entity;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -11,6 +12,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import javax.sql.DataSource;
+import net.atlasnet.minecraft.server.terrain.PostgresTerrainStore;
+import net.atlasnet.minecraft.server.terrain.TerrainStore;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.Tag;
@@ -146,10 +149,54 @@ public final class PostgresEntityCheckpoints {
 
     public boolean checkpointClaimed(AtlasNetEntityStore.Snapshot snapshot, long generation, long revision,
                                      boolean deleted) throws SQLException, IOException {
+        try (var connection = database.getConnection()) {
+            return checkpointClaimed(connection, snapshot, generation, revision, deleted);
+        }
+    }
+
+    /**
+     * Persist a confirmed interaction's player state and release its reservation
+     * together. A retry after an ambiguous commit leaves the checkpoint alone.
+     */
+    public boolean checkpointInteraction(AtlasNetEntityStore.Snapshot player, long generation,
+                                         long revision, TerrainStore.Reservation reservation)
+            throws SQLException, IOException {
+        if (!world.equals(reservation.chunk().world()) || !"minecraft:player".equals(player.entityType())) {
+            throw new IllegalArgumentException("Terrain settlement requires a player checkpoint in the same world");
+        }
+        try (var connection = database.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                var release = PostgresTerrainStore.releaseInteraction(connection, player.minecraftId(), reservation, true);
+                if (release == PostgresTerrainStore.ReservationRelease.ABSENT) {
+                    connection.rollback();
+                    return true;
+                }
+                if (release == PostgresTerrainStore.ReservationRelease.PENDING
+                        || !checkpointClaimed(connection, player, generation, revision, false)) {
+                    connection.rollback();
+                    return false;
+                }
+                connection.commit();
+                return true;
+            } catch (SQLException | IOException | RuntimeException failure) {
+                try {
+                    connection.rollback();
+                } catch (SQLException rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
+                }
+                throw failure;
+            }
+        }
+    }
+
+    private boolean checkpointClaimed(Connection connection, AtlasNetEntityStore.Snapshot snapshot,
+                                      long generation, long revision, boolean deleted)
+            throws SQLException, IOException {
         var output = new ByteArrayOutputStream();
         var data = snapshot.data();
         if (!deleted) NbtIo.writeCompressed(data, output);
-        try (var connection = database.getConnection(); var write = connection.prepareStatement("""
+        try (var write = connection.prepareStatement("""
                 UPDATE atlasnet_minecraft_entities
                 SET entity_type = ?, dimension = ?, revision = ?, entity_nbt = ?, deleted = ?, chunk_x = ?, chunk_z = ?
                 WHERE world = ? AND minecraft_uuid = ? AND entity_id = ?

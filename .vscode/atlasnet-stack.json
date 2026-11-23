@@ -25,9 +25,14 @@
         "desired_count": 2
       }
     },
+    "region_transfer": {
+      "mode": "immediate",
+      "hysteresis_distance": 0
+    },
     "spatialPlane": "XZ",
     "application": {
       "minecraft": {
+        "terrain-enabled": true,
         "server-properties": {
           "motd": "AtlasNet Minecraft",
           "level-name": "entity-acceptance",
@@ -75,7 +80,7 @@
         ],
         "control_panel": {
           "address": "127.0.0.1",
-          "port": 8080
+          "port": 8081
         },
         "ingress-listeners": [],
         "ingress-endpoints": [

@@ -18,6 +18,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import net.atlasnet.minecraft.sdk.core.MinecraftIngressPackets;
+import net.minecraft.core.UUIDUtil;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.ProtocolInfo;
 import net.minecraft.network.chat.Component;
@@ -53,13 +54,14 @@ import org.atlasnet.atlasnet.InteractiveAdmissionHandler;
 import org.atlasnet.atlasnet.Registry;
 import org.javagi.base.GErrorException;
 
-/** Registers the shard-independent, online-mode Minecraft admission handler. */
+/** Registers the shard-independent, Minecraft admission handler. */
 public final class MinecraftAdmissionHandler implements AutoCloseable {
     private static final String SERVER_ID = "";
     private static final int PACKET = 0;
     private static final int ENCRYPTION = 1;
     private static final int COMPRESSION = 2;
     private final MinecraftAdmissionConfig config;
+    private final boolean onlineMode;
     private final java.util.function.Function<java.util.UUID, byte[]> playerCheckpoint;
     private final VanillaConfiguration vanilla;
     private final MinecraftSessionService sessionService;
@@ -75,18 +77,25 @@ public final class MinecraftAdmissionHandler implements AutoCloseable {
 
     public MinecraftAdmissionHandler(MinecraftAdmissionConfig config,
             java.util.function.Function<java.util.UUID, byte[]> playerCheckpoint) throws CryptException {
+        this(config, true, playerCheckpoint);
+    }
+
+    public MinecraftAdmissionHandler(MinecraftAdmissionConfig config, boolean onlineMode,
+            java.util.function.Function<java.util.UUID, byte[]> playerCheckpoint) throws CryptException {
         this(config, new YggdrasilAuthenticationService(Proxy.NO_PROXY).createMinecraftSessionService(),
-                playerCheckpoint);
+                playerCheckpoint, onlineMode);
     }
 
     MinecraftAdmissionHandler(MinecraftAdmissionConfig config, MinecraftSessionService sessionService)
             throws CryptException {
-        this(config, sessionService, uuid -> new byte[0]);
+        this(config, sessionService, uuid -> new byte[0], true);
     }
 
     private MinecraftAdmissionHandler(MinecraftAdmissionConfig config, MinecraftSessionService sessionService,
-            java.util.function.Function<java.util.UUID, byte[]> playerCheckpoint) throws CryptException {
+            java.util.function.Function<java.util.UUID, byte[]> playerCheckpoint, boolean onlineMode)
+            throws CryptException {
         this.playerCheckpoint = playerCheckpoint;
+        this.onlineMode = onlineMode;
         this.config = config;
         this.sessionService = sessionService;
         this.keys = Crypt.generateKeyPair();
@@ -190,6 +199,16 @@ public final class MinecraftAdmissionHandler implements AutoCloseable {
                 return;
             }
             username = hello.name();
+            if (!onlineMode) {
+                if (!peer.getAddress().isLoopbackAddress()) {
+                    reject("Offline Minecraft admission requires a loopback connection", "Offline development is local only");
+                    return;
+                }
+                var offlineProfile = UUIDUtil.createOfflineProfile(username);
+                phase = Phase.VERIFYING;
+                verification = authentication.submit(() -> finishIdentity(offlineProfile));
+                return;
+            }
             send(message(PACKET, encode(LoginProtocols.CLIENTBOUND,
                     new ClientboundHelloPacket(SERVER_ID, keys.getPublic().getEncoded(), challenge, true))));
             phase = Phase.ENCRYPTION_RESPONSE;
@@ -216,19 +235,31 @@ public final class MinecraftAdmissionHandler implements AutoCloseable {
         private void authenticate(String hash) {
             try {
                 var result = sessionService.hasJoinedServer(username, hash, null);
-                byte[] restored = result == null || result.profile().getId() == null
-                        ? new byte[0] : playerCheckpoint.apply(result.profile().getId());
+                finishIdentity(result == null ? null : result.profile());
+            } catch (AuthenticationUnavailableException | RuntimeException failure) {
+                synchronized (this) {
+                    if (phase == Phase.VERIFYING) {
+                        reject("Minecraft session verification failed", "Authentication unavailable");
+                    }
+                }
+            }
+        }
+
+        private void finishIdentity(GameProfile admitted) {
+            try {
+                byte[] restored = admitted == null || admitted.getId() == null
+                        ? new byte[0] : playerCheckpoint.apply(admitted.getId());
                 if (restored.length > MinecraftIngressPackets.MAX_PLAYER_CHECKPOINT_BYTES)
                     throw new IllegalArgumentException("Player checkpoint exceeds admission limit");
                 synchronized (this) {
                     if (phase != Phase.VERIFYING) {
                         return;
                     }
-                    if (result == null || result.profile().getId() == null) {
+                    if (admitted == null || admitted.getId() == null) {
                         reject("Minecraft session verification declined", "Failed to verify username");
                         return;
                     }
-                    profile = result.profile();
+                    profile = admitted;
                     checkpoint = restored;
                     if (config.compressionThreshold() >= 0) {
                         var packet = encode(LoginProtocols.CLIENTBOUND,
@@ -246,11 +277,9 @@ public final class MinecraftAdmissionHandler implements AutoCloseable {
                             new ClientboundGameProfilePacket(profile, true))));
                     phase = Phase.LOGIN_ACK;
                 }
-            } catch (AuthenticationUnavailableException | RuntimeException failure) {
+            } catch (RuntimeException failure) {
                 synchronized (this) {
-                    if (phase == Phase.VERIFYING) {
-                        reject("Minecraft session verification failed", "Authentication unavailable");
-                    }
+                    if (phase == Phase.VERIFYING) reject("Minecraft profile admission failed", "Admission unavailable");
                 }
             }
         }

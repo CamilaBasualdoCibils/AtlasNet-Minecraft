@@ -49,3 +49,17 @@ tasks.register("prepareMinecraftHost") {
         file.writeText(host.runtimeClasspath.asPath)
     }
 }
+
+val terrainAgent by tasks.registering(Jar::class) {
+    dependsOn(host.classesTaskName)
+    archiveFileName.set("terrain-agent.jar")
+    destinationDirectory.set(layout.buildDirectory.dir("minecraft-host"))
+    from(host.output) {
+        include("net/atlasnet/minecraft/host/terrain/TerrainMutationAgent*.class")
+    }
+    manifest.attributes["Premain-Class"] = "net.atlasnet.minecraft.host.terrain.TerrainMutationAgent"
+}
+
+tasks.named("prepareMinecraftHost") {
+    dependsOn(terrainAgent)
+}

@@ -6,6 +6,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -38,9 +39,17 @@ JNIEnv* GetEnvironment()
   std::string nativeAccess = "--enable-native-access=ALL-UNNAMED";
   // Keep SIGINT and SIGTERM under the AtlasNet Node and worker lifecycle.
   std::string reduceSignals = "-Xrs";
-  JavaVMOption options[] = {{classpathOption.data()}, {libraryOption.data()}, {heapOption.data()},
-                            {nativeAccess.data()}, {reduceSignals.data()}};
-  JavaVMInitArgs args{JNI_VERSION_1_8, static_cast<jint>(std::size(options)), options, JNI_FALSE};
+  std::string terrainAgent;
+  std::vector<JavaVMOption> options{{classpathOption.data()}, {libraryOption.data()}, {heapOption.data()},
+                                    {nativeAccess.data()}, {reduceSignals.data()}};
+  if (IsWorker())
+  {
+    const auto agentPath = std::filesystem::path(ATLASNET_MINECRAFT_CLASSPATH_FILE)
+                               .replace_filename("terrain-agent.jar");
+    terrainAgent = "-javaagent:" + agentPath.string();
+    options.push_back({terrainAgent.data()});
+  }
+  JavaVMInitArgs args{JNI_VERSION_1_8, static_cast<jint>(options.size()), options.data(), JNI_FALSE};
   if (JNI_CreateJavaVM(&vm, &rawEnv, &args) != JNI_OK)
     throw std::runtime_error("Could not initialize Minecraft's Java 25 VM");
   return static_cast<JNIEnv*>(rawEnv);

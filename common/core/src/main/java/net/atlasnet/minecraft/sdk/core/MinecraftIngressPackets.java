@@ -8,6 +8,7 @@ import java.nio.ByteBuffer;
 /** Packet identifiers and connection metadata shared by Minecraft's AtlasNet providers. */
 public final class MinecraftIngressPackets {
     public static final int PLAY_PACKET_SIGNAL = 0x4d43504b;
+    public static final int PLAYER_ACTIVITY_SIGNAL = 0x4d435041;
 
     public static final int MAX_PLAYER_CHECKPOINT_BYTES = 1024 * 1024;
 

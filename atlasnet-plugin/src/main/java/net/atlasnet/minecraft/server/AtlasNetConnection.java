@@ -10,8 +10,10 @@ import io.netty.channel.ChannelPromise;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.util.ReferenceCountUtil;
 import java.net.SocketAddress;
+import java.util.ArrayDeque;
 import java.util.Objects;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.network.Connection;
 import net.minecraft.network.DisconnectionDetails;
@@ -28,6 +30,7 @@ import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.network.protocol.game.ClientboundSystemChatPacket;
 import net.minecraft.network.protocol.game.GameProtocols;
 import net.minecraft.network.protocol.game.ServerboundAcceptTeleportationPacket;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.server.network.ServerGamePacketListenerImpl;
 
 /**
@@ -35,12 +38,16 @@ import net.minecraft.server.network.ServerGamePacketListenerImpl;
  * Create and operate it on the Minecraft server thread.
  */
 public final class AtlasNetConnection extends Connection {
+    private static final System.Logger LOG = System.getLogger(AtlasNetConnection.class.getName());
+    private static final int MAX_PENDING_INPUT = 512;
     private final EmbeddedChannel transport;
     private final SocketAddress peer;
     private boolean disposed;
     private boolean restoringPlay;
+    private final ArrayDeque<Packet<?>> pendingInput = new ArrayDeque<>();
     private Integer initialTeleport;
     private Long keepAlive;
+    private Predicate<Packet<?>> intercept = packet -> false;
 
     /** The outgoing sink accepts a complete vanilla packet body, including its packet ID. */
     public AtlasNetConnection(SocketAddress peer, RegistryAccess registries, Consumer<byte[]> outgoing) {
@@ -57,6 +64,20 @@ public final class AtlasNetConnection extends Connection {
                 // Login and Configuration already finished on the ingress Node.
                 pipeline.replace("decoder", "inbound_config", new UnconfiguredPipelineHandler.Inbound());
                 configurePacketHandler(pipeline);
+                pipeline.addBefore("packet_handler", "atlasnet_pending_input",
+                        new io.netty.channel.ChannelInboundHandlerAdapter() {
+                            @Override public void channelRead(ChannelHandlerContext context, Object message) {
+                                if (message instanceof Packet<?> packet) {
+                                    if (pendingInput.size() < MAX_PENDING_INPUT) {
+                                        pendingInput.addLast(packet);
+                                    } else {
+                                        disconnect(net.minecraft.network.chat.Component.literal("Too much queued Minecraft input"));
+                                    }
+                                } else {
+                                    context.fireChannelRead(message);
+                                }
+                            }
+                        });
                 pipeline.addBefore("packet_handler", "atlasnet_keep_alive",
                         new io.netty.channel.ChannelInboundHandlerAdapter() {
                             @Override
@@ -66,6 +87,7 @@ public final class AtlasNetConnection extends Connection {
                                     if (keepAlive == null || response.getId() != keepAlive) return;
                                     keepAlive = null;
                                 }
+                                if (message instanceof Packet<?> packet && intercept.test(packet)) return;
                                 context.fireChannelRead(message);
                             }
                         });
@@ -98,6 +120,12 @@ public final class AtlasNetConnection extends Connection {
         return peer;
     }
 
+    @Override
+    public void exceptionCaught(ChannelHandlerContext context, Throwable cause) {
+        LOG.log(System.Logger.Level.WARNING, "Embedded Minecraft connection failed", cause);
+        super.exceptionCaught(context, cause);
+    }
+
     /** Reuse normal server-side placement without replaying client-side join or teleport. */
     void restorePlay(Runnable placePlayer) {
         restoringPlay = true;
@@ -112,19 +140,39 @@ public final class AtlasNetConnection extends Connection {
         }
     }
 
+    /** Preserve packet order while giving vanilla regular tick boundaries between movements. */
+    void tickInput() {
+        var context = transport.pipeline().context("atlasnet_pending_input");
+        int moves = 0;
+        while (!pendingInput.isEmpty() && isConnected()) {
+            if (pendingInput.peekFirst() instanceof ServerboundMovePlayerPacket && ++moves > 2) break;
+            context.fireChannelRead(pendingInput.removeFirst());
+        }
+    }
+
+    boolean hasPendingInput() {
+        return !pendingInput.isEmpty();
+    }
+
     @Override
     public void send(Packet<?> packet, PacketSendListener completion, boolean flush) {
         if (disposed) return;
+        // The shard bridge publishes session lifecycle messages as cluster Signals.
+        if (packet instanceof ClientboundSystemChatPacket chat
+                && chat.content().getContents() instanceof TranslatableContents translated) {
+            switch (translated.getKey()) {
+                case "multiplayer.player.joined", "multiplayer.player.joined.renamed", "multiplayer.player.left" -> {
+                    return;
+                }
+                default -> {}
+            }
+        }
         if (restoringPlay) {
             if (packet instanceof ClientboundLoginPacket) return;
             if (packet instanceof ClientboundPlayerPositionPacket position) {
                 initialTeleport = position.getId();
                 return;
             }
-            if (packet instanceof ClientboundSystemChatPacket chat &&
-                    chat.content().getContents() instanceof TranslatableContents translated &&
-                    (translated.getKey().equals("multiplayer.player.joined") ||
-                            translated.getKey().equals("multiplayer.player.joined.renamed"))) return;
         }
         if (packet instanceof ClientboundKeepAlivePacket challenge) keepAlive = challenge.getId();
         super.send(packet, completion, flush);
@@ -133,6 +181,10 @@ public final class AtlasNetConnection extends Connection {
     /** Feed a complete packet body into the active vanilla listener. */
     public void receivePacket(byte[] packet) {
         if (transport.isActive()) transport.writeInbound(Unpooled.wrappedBuffer(packet));
+    }
+
+    void interceptPlayPackets(Predicate<Packet<?>> handler) {
+        intercept = Objects.requireNonNull(handler);
     }
 
     /** Called when AtlasNet closes the connection, after the last packet is delivered. */
