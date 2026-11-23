@@ -20,9 +20,30 @@
   "clusterConfigPath": "",
   "clusterSettings": {
     "controller": {
-      "heuristic": "atlasnet.kdtree2d"
+      "heuristic": "example.xsplit2d",
+      "shards": {
+        "desired_count": 2
+      }
     },
-    "spatialPlane": "XZ"
+    "spatialPlane": "XZ",
+    "application": {
+      "minecraft": {
+        "server-properties": {
+          "motd": "AtlasNet Minecraft",
+          "level-name": "entity-acceptance",
+          "level-type": "minecraft:flat",
+          "level-seed": "atlasnet-entity-acceptance",
+          "online-mode": true,
+          "view-distance": 10,
+          "simulation-distance": 10,
+          "difficulty": "normal",
+          "gamemode": "survival",
+          "max-players": 100,
+          "pvp": true,
+          "spawn-protection": 0
+        }
+      }
+    }
   },
   "groups": [
     {
@@ -32,24 +53,30 @@
         "Database",
         "Shard",
         "ControllerEligible",
-        "ClientIngress"
+        "ClientIngress",
+        "ControlPanel"
       ],
       "args": [],
       "nodeMode": "direct",
       "nodeConfigPath": "",
       "nodeSettings": {
         "shards": {
-          "max_count": 1,
+          "max_count": 2,
           "cpu_request": 2,
           "memory_request": "512MiB",
           "worker_executable": ""
         },
         "modules": [
+          "${workspaceFolder}/AtlasNet/build/Examples/Heuristics/XAxisSplit/AtlasNetXAxisSplit.so",
           "${workspaceFolder}/build/host/libatlasnet-minecraft-shard.so",
           "${workspaceFolder}/build/host/libatlasnet-minecraft-endpoint.so",
           "${workspaceFolder}/build/host/libatlasnet-minecraft-admission.so",
           "${workspaceFolder}/build/host/libatlasnet-minecraft-spawn.so"
         ],
+        "control_panel": {
+          "address": "127.0.0.1",
+          "port": 8080
+        },
         "ingress-listeners": [],
         "ingress-endpoints": [
           {

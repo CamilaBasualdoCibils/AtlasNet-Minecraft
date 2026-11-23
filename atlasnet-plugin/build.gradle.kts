@@ -14,6 +14,8 @@ tasks.withType<JavaCompile>().configureEach {
     options.release.set(21)
 }
 
+repositories { mavenCentral() }
+
 val host by sourceSets.creating {
     compileClasspath += sourceSets.main.get().output
     runtimeClasspath += sourceSets.main.get().output
@@ -28,6 +30,7 @@ configurations.named(host.runtimeClasspathConfigurationName) {
     extendsFrom(configurations.compileOnly.get())
 }
 dependencies {
+    add(host.implementationConfigurationName, "org.postgresql:postgresql:42.7.14")
     add(host.implementationConfigurationName, project(":atlasnet-admissionHandler"))
     add(host.implementationConfigurationName, project(":atlasnet-endpoint"))
     add(host.implementationConfigurationName, project(":atlasnet-spawnResolver"))

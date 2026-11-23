@@ -138,13 +138,20 @@ The checked-in AtlasNet Local Stack profile runs the standard
 from `build/host` in the Node's `modules` setting. The modules register
 through the standard AtlasNet module entry point and share a JVM per process.
 Shard-only Nodes need only the shard module. The group runs one Node
-with Database, ControllerEligible, Shard, and ClientIngress capabilities and
-one Minecraft shard. It uses managed Valkey and the `minecraft` ingress endpoint.
+with Database, ControllerEligible, Shard, and ClientIngress capabilities.
+The entity acceptance profile requests two Minecraft shards and creates a
+separate superflat world named `entity-acceptance` from the same seed on
+both workers. It loads the `example.xsplit2d` module so authority crosses
+the X=0 plane, subject to AtlasNet's hysteresis. The loopback Control Panel
+can verify the player retains one AtlasNet EntityID while its shard changes.
+Existing `world` directories and their checkpoints are preserved. It uses managed Valkey and the `minecraft` ingress endpoint.
 
 Set `ATLASNET_MINECRAFT_WORLD_DIR` before launching to choose the worker's
-server directory. It defaults to `minecraft-shard` relative to the stack's
-working directory. Prepare the server directory with your accepted Minecraft
-EULA. It can also contain vanilla `server.properties` and world data. Once
+primary server directory. It defaults to `minecraft-shard` relative to the
+stack's working directory. Prepare it with your accepted Minecraft EULA and
+any existing vanilla world data. Additional workers reserve siblings such as
+`minecraft-shard-2` and inherit the primary directory's EULA acceptance when
+first created. Entity checkpoints use the same logical PostgreSQL world key. Edit `clusterSettings.application.minecraft.server-properties` in the Local Stack cluster settings and restart the stack to apply changes. The host uses vanilla property parsing. Admission uses the same compression and function permission settings as the shard, and the shard sends its configured view distance in vanilla Play packets. Online-mode authentication is required. Once
 the worker is ready, use Direct Connection to `localhost:25565` from a
 vanilla Minecraft 1.21.1 client signed in to a Minecraft account.
 
@@ -199,8 +206,8 @@ The service uses a Docker volume named for this checkout. Set
 `ATLASNET_POSTGRES_VOLUME` to select a different volume. Local Stack runs the
 prelaunch command once and has no corresponding shutdown command. To stop
 PostgreSQL after stopping the stack, run `scripts/minecraft-postgres.sh stop`.
-This removes the container and preserves the volume. Minecraft currently has
-no PostgreSQL storage dependency.
+This removes the container and preserves the volume. Minecraft uses this
+database for entity checkpoints.
 
 ## Compile against the AtlasNet SDK
 
@@ -237,3 +244,79 @@ initialize native code, or bundle dependency classes. Running a provider will re
 matching AtlasNet and Java-GI JARs, JDK 25, the same-build
 `libatlasnet-gobject.so` and its native dependencies, library search paths, and
 JVM native access configured as described in the upstream SDK instructions.
+
+### Entity snapshots and checkpoints
+
+The shard starts publishing a player's snapshot after it receives the first
+AtlasNet-routed Play command for the player. That command arrives after the
+Node has accepted the spawn. The bridge samples the current vanilla
+`ServerPlayer` on the Minecraft thread every 20 ticks. The worker coalesces
+samples and writes changed snapshots to the named `minecraft.entities`
+StateStore, keyed by the unsigned AtlasNet EntityID. Conditional writes
+compare against the previous published record. A comparison failure stops
+publication for that EntityID. A backend error leaves the latest sample
+pending for retry, including while the entity is retiring. Retirement and graceful shutdown remove
+records only if they still match the worker's last published value.
+
+Snapshots contain vanilla persistent NBT. Changed player snapshots are checkpointed to
+the Local Stack PostgreSQL database. Set
+`application.minecraft.entity-store.persistence-interval-ms` in cluster
+settings to change the five-second interval. Disconnect requests a final
+checkpoint. On a graceful shard stop, the Minecraft thread captures final
+samples and the AtlasNet worker services asynchronous completion within its
+existing four-second deadline. PostgreSQL can commit the final local sample
+if StateStore communication has already stopped during a whole-node stop. The admission worker retrieves the latest committed checkpoint
+after verifying the Minecraft profile. The shard supplies it to vanilla's
+player-data loader before the player joins. Vanilla player files remain the
+fallback for profiles with no checkpoint. A checkpoint can lag live state
+if a worker exits before its next write. During player transfer the
+destination attaches a restored player to the existing Play session after it
+receives the first command routed to the new owner. It preserves the vanilla
+player entity ID and suppresses the join and initial teleport packets.
+Both workers need matching terrain for the same coordinates to look and
+behave the same after a handoff.
+
+For ordinary entities, the Minecraft 1.21.1 lifecycle observer gates ticking
+until AtlasNet registration and checkpoint restore finish. A transient
+PostgreSQL read failure keeps the entity inactive and retries the restore.
+Startup indexes
+durable chunk coordinates. When vanilla loads one of those chunks, the
+worker also reconstructs checkpointed entities absent from the local
+entity file. The existing UUID reservation gates activation when multiple
+workers load the same chunk. Startup also derives coordinates for older checkpoints from their saved NBT. PostgreSQL fences writes from an older
+runtime ownership generation even when a handoff keeps the EntityID.
+Unloading requests a final checkpoint. Permanent removal writes a PostgreSQL tombstone. Checkpoint
+failures leave the revision pending for retry while the worker is running.
+
+The transfer adapter uses AtlasNet's existing prepare, commit, and abort
+callbacks. The source freezes vanilla ticking and captures
+NBT. The destination stages a detached entity, conditionally installs a new
+StateStore generation, then adds the entity to its level with the original
+AtlasNet EntityID and Minecraft UUID. Preparing a transfer for a mounted
+entity or a vehicle with passengers currently fails. Live cross-shard
+handoff still requires verification with the Local Stack profile.
+
+
+Operators can obtain a locally authoritative entity's ID with
+`/atlasnetentity id <selector>` and read its revision, UUID, and active
+effects from any shard with `/atlasnetentity read <entity-id>`.
+Use `/atlasnetentity effect <entity-id> minecraft:glowing 1200 0` from
+another shard to ask the owner to apply the effect via EntityRPC. Read
+the record again to confirm publication of a newer revision. For a
+single-account remote player test, run `/atlasnetentity probe <entity-id> 30`
+on the current owner, cross the X=0 boundary, and remain on the other shard.
+The initiating shard logs the before and after revisions, direct-write
+rejection, and the resulting Glowing effect. A successful player probe also
+sends a vanilla chat message directly from the initiating shard by Signal,
+even after the player's authority has moved.
+
+
+### Spatial API boundaries
+
+Use an entity-attached Spatial Interest for persistent nearby-entity
+membership and existing enter/exit notifications across shards. Use a world
+interest for fixed regions. Read observed entity snapshots through
+`AtlasNetEntityStore` and route authoritative changes through EntityRPC.
+A spatial EntityRPC selects matching authoritative entities for one call.
+SpatialRPC instead routes to the owners of intersecting regions, including
+regions without entities. Use Signals to deliver results to clients.

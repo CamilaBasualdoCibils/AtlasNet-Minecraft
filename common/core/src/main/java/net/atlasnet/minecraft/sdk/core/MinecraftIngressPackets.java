@@ -9,6 +9,8 @@ import java.nio.ByteBuffer;
 public final class MinecraftIngressPackets {
     public static final int PLAY_PACKET_SIGNAL = 0x4d43504b;
 
+    public static final int MAX_PLAYER_CHECKPOINT_BYTES = 1024 * 1024;
+
     private MinecraftIngressPackets() {}
 
     /** Writes the actual transport peer, rather than an address claimed in the Minecraft handshake. */

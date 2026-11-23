@@ -87,7 +87,7 @@ stack_build() {
         exit 1
     fi
     GI_SCANNER_DISABLE_CACHE=1 cmake --build "$root/AtlasNet/build" --parallel "$jobs" \
-        --target AtlasNetNode AtlasNetShardWorker AtlasNetJava Valkey-Server-Compile
+        --target AtlasNetNode AtlasNetShardWorker AtlasNetJava AtlasNetXAxisSplit Valkey-Server-Compile
     cmake -S "$root" -B "$root/build" -DATLASNET_MINECRAFT_HOST=ON
     cmake --build "$root/build" --parallel "$jobs" --target atlasnet-minecraft-modules
     exec "$root/scripts/minecraft-postgres.sh"

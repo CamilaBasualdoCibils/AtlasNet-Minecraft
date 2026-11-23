@@ -60,6 +60,7 @@ public final class MinecraftAdmissionHandler implements AutoCloseable {
     private static final int ENCRYPTION = 1;
     private static final int COMPRESSION = 2;
     private final MinecraftAdmissionConfig config;
+    private final java.util.function.Function<java.util.UUID, byte[]> playerCheckpoint;
     private final VanillaConfiguration vanilla;
     private final MinecraftSessionService sessionService;
     private final KeyPair keys;
@@ -69,11 +70,23 @@ public final class MinecraftAdmissionHandler implements AutoCloseable {
     private final Map<Long, Session> sessions = new HashMap<>();
 
     public MinecraftAdmissionHandler(MinecraftAdmissionConfig config) throws CryptException {
-        this(config, new YggdrasilAuthenticationService(Proxy.NO_PROXY).createMinecraftSessionService());
+        this(config, uuid -> new byte[0]);
+    }
+
+    public MinecraftAdmissionHandler(MinecraftAdmissionConfig config,
+            java.util.function.Function<java.util.UUID, byte[]> playerCheckpoint) throws CryptException {
+        this(config, new YggdrasilAuthenticationService(Proxy.NO_PROXY).createMinecraftSessionService(),
+                playerCheckpoint);
     }
 
     MinecraftAdmissionHandler(MinecraftAdmissionConfig config, MinecraftSessionService sessionService)
             throws CryptException {
+        this(config, sessionService, uuid -> new byte[0]);
+    }
+
+    private MinecraftAdmissionHandler(MinecraftAdmissionConfig config, MinecraftSessionService sessionService,
+            java.util.function.Function<java.util.UUID, byte[]> playerCheckpoint) throws CryptException {
+        this.playerCheckpoint = playerCheckpoint;
         this.config = config;
         this.sessionService = sessionService;
         this.keys = Crypt.generateKeyPair();
@@ -198,9 +211,15 @@ public final class MinecraftAdmissionHandler implements AutoCloseable {
             verification = authentication.submit(() -> authenticate(hash));
         }
 
+        private byte[] checkpoint = new byte[0];
+
         private void authenticate(String hash) {
             try {
                 var result = sessionService.hasJoinedServer(username, hash, null);
+                byte[] restored = result == null || result.profile().getId() == null
+                        ? new byte[0] : playerCheckpoint.apply(result.profile().getId());
+                if (restored.length > MinecraftIngressPackets.MAX_PLAYER_CHECKPOINT_BYTES)
+                    throw new IllegalArgumentException("Player checkpoint exceeds admission limit");
                 synchronized (this) {
                     if (phase != Phase.VERIFYING) {
                         return;
@@ -210,6 +229,7 @@ public final class MinecraftAdmissionHandler implements AutoCloseable {
                         return;
                     }
                     profile = result.profile();
+                    checkpoint = restored;
                     if (config.compressionThreshold() >= 0) {
                         var packet = encode(LoginProtocols.CLIENTBOUND,
                                 new ClientboundLoginCompressionPacket(config.compressionThreshold()));
@@ -259,6 +279,7 @@ public final class MinecraftAdmissionHandler implements AutoCloseable {
                 var metadata = ByteBuffer.allocate(3 + peer.getAddress().getAddress().length);
                 MinecraftIngressPackets.writePeer(metadata, peer);
                 payload.writeBytes(metadata.array());
+                payload.writeBytes(checkpoint);
                 var result = new AdmissionResult();
                 result.setData(bytes(payload));
                 phase = Phase.DONE;

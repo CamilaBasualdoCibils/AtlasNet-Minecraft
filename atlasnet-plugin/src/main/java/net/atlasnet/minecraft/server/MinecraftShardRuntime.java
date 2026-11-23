@@ -35,10 +35,10 @@ import org.atlasnet.atlasnet.Shard;
 
 /** Starts the vanilla dedicated server with AtlasNet as its connection transport. */
 public final class MinecraftShardRuntime implements AutoCloseable {
-    private final DedicatedServer server;
+    private final HostedServer server;
     private final CompletableFuture<Void> ready;
 
-    private MinecraftShardRuntime(DedicatedServer server, CompletableFuture<Void> ready) {
+    private MinecraftShardRuntime(HostedServer server, CompletableFuture<Void> ready) {
         this.server = server;
         this.ready = ready;
     }
@@ -49,13 +49,50 @@ public final class MinecraftShardRuntime implements AutoCloseable {
 
     public static MinecraftShardRuntime start(Path directory, Shard shard,
                                               MinecraftChunkSubscriptions subscriptions) throws IOException {
+        return start(directory, shard, subscriptions, new java.util.Properties());
+    }
+
+    public static MinecraftShardRuntime start(Path directory, Shard shard,
+                                              MinecraftChunkSubscriptions subscriptions,
+                                              java.util.Properties properties) throws IOException {
+        return start(directory, shard, subscriptions, properties, MinecraftShardBridge::new);
+    }
+
+    public static MinecraftShardRuntime start(Path directory, Shard shard,
+                                              MinecraftChunkSubscriptions subscriptions,
+                                              java.util.Properties properties,
+                                              java.util.function.BiFunction<MinecraftServer, Shard,
+                                                      MinecraftShardBridge> bridgeFactory) throws IOException {
+        return start(directory, shard, subscriptions, properties, bridgeFactory, null);
+    }
+
+    public static MinecraftShardRuntime start(Path directory, Shard shard,
+                                              MinecraftChunkSubscriptions subscriptions,
+                                              java.util.Properties properties,
+                                              java.util.function.BiFunction<MinecraftServer, Shard,
+                                                      MinecraftShardBridge> bridgeFactory,
+                                              MinecraftEntityLifecycle.Observer entityObserver) throws IOException {
         Files.createDirectories(directory);
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         if (!new Eula(directory.resolve("eula.txt")).hasAgreedToEULA()) {
             throw new IOException("Minecraft requires EULA acceptance in " + directory.resolve("eula.txt"));
         }
-        var settings = new DedicatedServerSettings(directory.resolve("server.properties"));
+        var source = Files.createTempFile("atlasnet-minecraft-", ".properties");
+        DedicatedServerSettings settings;
+        try {
+            try (var output = Files.newOutputStream(source)) {
+                properties.store(output, null);
+            }
+            settings = new DedicatedServerSettings(source) {
+                @Override
+                public void forceSave() {
+                    // Cluster configuration is read-only. Keep vanilla runtime changes in memory.
+                }
+            };
+        } finally {
+            Files.deleteIfExists(source);
+        }
         var props = settings.getProperties();
         var storage = LevelStorageSource.createDefault(directory).createAccess(props.levelName);
         try {
@@ -86,7 +123,7 @@ public final class MinecraftShardRuntime implements AutoCloseable {
                 var services = Services.create(new YggdrasilAuthenticationService(Proxy.NO_PROXY), directory.toFile());
                 var ready = new CompletableFuture<Void>();
                 var server = MinecraftServer.spin(thread -> new HostedServer(thread, storage, packs, world,
-                        settings, services, shard, subscriptions, ready));
+                        settings, services, shard, subscriptions, ready, bridgeFactory, entityObserver));
                 return new MinecraftShardRuntime(server, ready);
             } catch (RuntimeException failure) {
                 world.close();
@@ -102,6 +139,12 @@ public final class MinecraftShardRuntime implements AutoCloseable {
         return ready;
     }
 
+    /** Request a vanilla stop and let the calling AtlasNet worker keep polling. */
+    public CompletableFuture<Void> stopAsync() {
+        server.halt(false);
+        return server.stopped;
+    }
+
     @Override
     public void close() {
         server.halt(true);
@@ -109,20 +152,29 @@ public final class MinecraftShardRuntime implements AutoCloseable {
 
     private static final class HostedServer extends DedicatedServer {
         private final ServerConnectionListener atlasConnections;
+        private final LevelStorageSource.LevelStorageAccess storage;
         private final Shard shard;
         private final MinecraftChunkSubscriptions subscriptions;
         private final CompletableFuture<Void> ready;
+        private final CompletableFuture<Void> stopped = new CompletableFuture<>();
         private MinecraftShardBridge bridge;
+        private final MinecraftEntityLifecycle.Observer entityObserver;
+        private final java.util.function.BiFunction<MinecraftServer, Shard, MinecraftShardBridge> bridgeFactory;
 
         HostedServer(Thread thread, LevelStorageSource.LevelStorageAccess storage,
                      net.minecraft.server.packs.repository.PackRepository packs, WorldStem world,
                      DedicatedServerSettings settings, Services services, Shard shard,
-                     MinecraftChunkSubscriptions subscriptions, CompletableFuture<Void> ready) {
+                     MinecraftChunkSubscriptions subscriptions, CompletableFuture<Void> ready,
+                     java.util.function.BiFunction<MinecraftServer, Shard, MinecraftShardBridge> bridgeFactory,
+                     MinecraftEntityLifecycle.Observer entityObserver) {
             super(thread, storage, packs, world, settings, DataFixers.getDataFixer(), services,
                     LoggerChunkProgressListener::createFromGameruleRadius);
+            this.storage = storage;
             this.shard = shard;
             this.subscriptions = subscriptions;
             this.ready = ready;
+            this.bridgeFactory = bridgeFactory;
+            this.entityObserver = entityObserver;
             atlasConnections = new ServerConnectionListener(this) {
                 @Override
                 public void startTcpServerListener(InetAddress address, int port) {
@@ -133,6 +185,7 @@ public final class MinecraftShardRuntime implements AutoCloseable {
                 public void tick() {
                     super.tick();
                     if (bridge != null) bridge.tickConnections();
+                    if (entityObserver != null) entityObserver.tick();
                 }
             };
         }
@@ -145,8 +198,9 @@ public final class MinecraftShardRuntime implements AutoCloseable {
         @Override
         protected void createLevels(net.minecraft.server.level.progress.ChunkProgressListener progress) {
             super.createLevels(progress);
-            if (subscriptions != null) {
-                for (var level : getAllLevels()) subscriptions.observe(level);
+            for (var level : getAllLevels()) {
+                if (subscriptions != null) subscriptions.observe(level);
+                if (entityObserver != null) MinecraftEntityLifecycle.install(level, entityObserver);
             }
         }
 
@@ -157,13 +211,25 @@ public final class MinecraftShardRuntime implements AutoCloseable {
         }
 
         @Override
+        public void stopServer() {
+            try {
+                if (bridge != null) bridge.captureBeforeShutdown();
+                if (entityObserver != null) entityObserver.beforeShutdown();
+                super.stopServer();
+            } finally {
+                stopped.complete(null);
+            }
+        }
+
+        @Override
         public boolean initServer() throws IOException {
             try {
                 if (!super.initServer()) {
                     ready.completeExceptionally(new IOException("Vanilla Minecraft initialization failed"));
                     return false;
                 }
-                bridge = new MinecraftShardBridge(this, shard);
+                CheckpointPlayerData.install(getPlayerList(), storage, DataFixers.getDataFixer());
+                bridge = bridgeFactory.apply(this, shard);
                 ready.complete(null);
                 return true;
             } catch (IOException | RuntimeException failure) {
