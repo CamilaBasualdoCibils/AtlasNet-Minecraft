@@ -17,7 +17,23 @@ public final class MinecraftTcpCodecTest {
         compressionTransitionAndBothPacketForms();
         encryptedCompressionPreservesLongRunningState();
         malformedFramesFailClosed();
-        System.out.println("Minecraft TCP codec checks passed");
+        validatesEndpointPorts();
+        System.out.println("Minecraft TCP codec and endpoint configuration checks passed");
+    }
+
+    private static void validatesEndpointPorts() {
+        check(MinecraftTcpEndpoint.configuredPort("{}", 25565) == 25565, "default port");
+        check(MinecraftTcpEndpoint.configuredPort("{\"port\":25566}", 25565) == 25566, "configured port");
+        check(MinecraftTcpEndpoint.configuredPort("{\"port\":65535}", 25565) == 65535, "maximum port");
+        for (String invalid : new String[]{"[]", "{\"port\":0}", "{\"port\":65536}",
+                "{\"port\":25566.5}", "{\"port\":\"25566\"}", "{\"port\":null}"}) {
+            try {
+                MinecraftTcpEndpoint.configuredPort(invalid, 25565);
+                throw new AssertionError("Accepted invalid endpoint arguments " + invalid);
+            } catch (IllegalArgumentException expected) {
+                check(expected.getMessage().startsWith("args"), "endpoint configuration error");
+            }
+        }
     }
 
     private static void encryptionMatchesReferenceAcrossReadBoundaries() throws IOException {

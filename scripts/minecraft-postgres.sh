@@ -4,7 +4,13 @@ set -euo pipefail
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 stack_id="$(printf '%s' "$project_dir" | sha256sum | cut -c1-12)"
 container="atlasnet-minecraft-postgres-$stack_id"
-volume="${ATLASNET_POSTGRES_VOLUME:-atlasnet-minecraft-postgres-$stack_id}"
+data_dir="$project_dir/build/postgres"
+mount_type=bind
+mount_source="$data_dir"
+if [[ -n "${ATLASNET_POSTGRES_VOLUME:-}" ]]; then
+    mount_type=volume
+    mount_source="$ATLASNET_POSTGRES_VOLUME"
+fi
 port="${ATLASNET_POSTGRES_PORT:-45432}"
 export POSTGRES_DB="${ATLASNET_POSTGRES_DATABASE:-minecraft}"
 export POSTGRES_USER="${ATLASNET_POSTGRES_USER:-minecraft}"
@@ -35,11 +41,19 @@ if docker container inspect "$container" >/dev/null 2>&1; then
         printf 'Existing PostgreSQL container uses a different port. Run %s stop before changing ports.\n' "$0" >&2
         exit 1
     fi
+    configured_mount="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Type}}:{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}{{end}}{{end}}' "$container")"
+    if [[ "$configured_mount" != "$mount_type:$mount_source" ]]; then
+        printf 'Existing PostgreSQL container uses %s. Stop and migrate its data before changing storage.\n' "$configured_mount" >&2
+        exit 1
+    fi
     docker start "$container" >/dev/null
 else
+    if [[ "$mount_type" == bind ]]; then
+        mkdir -p "$data_dir"
+    fi
     docker run --detach --name "$container" \
         --publish "127.0.0.1:$port:5432" \
-        --mount "type=volume,source=$volume,target=/var/lib/postgresql/data" \
+        --mount "type=$mount_type,source=$mount_source,target=/var/lib/postgresql/data" \
         --env POSTGRES_DB --env POSTGRES_USER --env POSTGRES_PASSWORD \
         postgres:17 >/dev/null
 fi

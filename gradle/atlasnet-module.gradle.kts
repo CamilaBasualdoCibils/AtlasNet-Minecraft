@@ -26,7 +26,7 @@ fun sdkJar(property: String, defaultPath: String? = null): Provider<File> {
 }
 
 dependencies.add("compileOnly", files(
-    sdkJar("atlasnetJavaSdkJar", "AtlasNet/build/Integrations/Java/atlasnet-1.0.jar"),
+    sdkJar("atlasnetJavaSdkJar", "build/AtlasNet/Integrations/Java/atlasnet-1.0.jar"),
     sdkJar("atlasnetJavaGiGlibJar"),
     sdkJar("atlasnetJavaJSpecifyJar"),
 ))

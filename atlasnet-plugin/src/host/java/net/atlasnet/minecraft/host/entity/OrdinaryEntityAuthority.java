@@ -588,19 +588,29 @@ public final class OrdinaryEntityAuthority implements MinecraftEntityLifecycle.O
                 if (!identities.putWithOptionsFinish(result)) return;
                 entry.claimed = true;
                 reservations.add(entry);
-                if (!entry.retired && !stopping) {
-                    entry.id = shard.registerEntity(transform(entry.x, entry.y, entry.z));
-                    if (entry.id != 0) {
-                        activate.run();
-                        return;
-                    }
-                }
-                release(entry);
+                if (entry.retired || stopping) release(entry);
+                else actions.add(() -> registerReserved(entry, activate));
             } catch (GErrorException failure) {
                 log(entry, failure);
                 release(entry);
             }
         });
+    }
+
+    private void registerReserved(Entry entry, Runnable activate) {
+        // Registration polls shard RPC while waiting and can deliver more StateStore callbacks.
+        if (entry.claimed && !entry.retired && !stopping) {
+            try {
+                entry.id = shard.registerEntity(transform(entry.x, entry.y, entry.z));
+                if (entry.id != 0) {
+                    activate.run();
+                    return;
+                }
+            } catch (GErrorException failure) {
+                log(entry, failure);
+            }
+        }
+        release(entry);
     }
 
     @Override public boolean mayTick(Entity entity) {

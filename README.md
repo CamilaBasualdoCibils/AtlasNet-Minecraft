@@ -29,18 +29,22 @@ Examples live at `examples/plugin/`, `examples/mod/client/`, and
 SDK. Future adapter notes live under `platforms/`. The archived prototype and
 its original build files are under [`legacy/`](legacy/README.md). The
 AtlasNet submodule remains at `AtlasNet/`. The Minecraft build excludes the
-archive and consumes prebuilt AtlasNet Java bindings.
+archive and builds AtlasNet and its Java bindings from the submodule.
 
 ## Build
 
-Use CMake 3.25 or later and the Gradle 9.2.1 wrapper. The plugin and
-client/server mod SDKs use JDK 21. The three ingress projects use JDK 25 and
-prebuilt AtlasNet binding JARs. See the [ingress module setup](docs/atlasnet-modules.md)
-before running the default build. The wrapper may download Gradle on first use.
+Use CMake 3.25 or later, Ninja, Clang, vcpkg, JDK 21, and JDK 25. Set
+`VCPKG_ROOT` and point `JAVA_HOME` to JDK 25. Provision Java-GI and the Minecraft
+1.21.1 runtime as described in the [module setup](docs/atlasnet-modules.md#compile-against-the-atlasnet-sdk).
+The wrapper may download Gradle on first use.
 
 ```sh
-cmake -S . -B build
+git submodule update --init --recursive
+cmake --preset minecraft \
+  -DATLASNET_JAVA_GI_EXECUTABLE=/path/to/java-gi/bin/java-gi \
+  '-DATLASNET_JAVA_RUNTIME_JARS=/path/to/glib-1.0.0-RC3.jar;/path/to/jspecify-1.0.1.jar'
 cmake --build build
+cmake --build build --target atlasnet-minecraft-stack
 cmake --build build --target atlasnet-plugin
 cmake --build build --target atlasnet-endpoint
 cmake --build build --target atlasnet-admissionHandler
@@ -49,8 +53,17 @@ cmake --build build --target atlasnet-mod-client
 cmake --build build --target atlasnet-mod-server
 ```
 
-The default CMake target, `atlasnet-sdk`, runs one Gradle build for the API
-projects, the ingress scaffolds, and the examples. The wrapper also works directly:
+The default build includes `atlasnet-sdk` for the Gradle projects and
+`atlasnet-minecraft-stack` for the AtlasNet executables, Valkey, and the four
+Minecraft native modules. The root build passes the generated SDK JAR and
+its compile-time dependencies to Gradle. The `server` build preset selects
+the stack target in VS Code. CMake rediscovers tools provisioned in
+`.tools/minecraft-build-deps` after a cache reset. If you configured `build/` with the
+earlier standalone Minecraft build, use `cmake --fresh --preset minecraft`
+with the same Java-GI options once to switch toolchains.
+
+The wrapper also works directly after the binding JAR is built and the
+Gradle dependency properties are set:
 
 ```sh
 ./gradlew :atlasnet-plugin:build

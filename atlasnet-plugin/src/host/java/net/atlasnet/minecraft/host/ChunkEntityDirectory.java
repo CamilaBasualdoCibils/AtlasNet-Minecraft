@@ -1,5 +1,6 @@
 package net.atlasnet.minecraft.host;
 
+import java.util.ArrayDeque;
 import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -15,10 +16,25 @@ import org.javagi.base.GErrorException;
 public final class ChunkEntityDirectory {
     private final Shard shard;
     private final StateStoreValues values;
+    private final ArrayDeque<Runnable> registrations = new ArrayDeque<>();
+    private boolean stopping;
 
     public ChunkEntityDirectory(Shard shard) throws GErrorException {
         this.shard = shard;
         values = shard.getStateStore("minecraft.chunks").getValues();
+        shard.onPoll(() -> {
+            for (int i = 0; i < 32; i++) {
+                var registration = registrations.poll();
+                if (registration == null) break;
+                registration.run();
+            }
+        });
+        shard.onShutdown(() -> {
+            stopping = true;
+            for (Runnable registration; (registration = registrations.poll()) != null;) {
+                registration.run();
+            }
+        });
     }
 
     /** Call from the AtlasNet worker. A reservation is intentionally invisible to lookups. */
@@ -38,10 +54,12 @@ public final class ChunkEntityDirectory {
 
     /** Race overlapping replicas for one registration. Only the reservation holder creates an entity. */
     public CompletableFuture<OptionalLong> register(ChunkKey chunk) {
+        if (stopping) return CompletableFuture.completedFuture(OptionalLong.empty());
         String key = key(chunk);
         String reservation = "pending/" + UUID.randomUUID();
-        return put(key, reservation, StateStoreWriteCondition.IF_ABSENT, null).thenCompose(reserved -> {
+        return put(key, reservation, StateStoreWriteCondition.IF_ABSENT, null).thenComposeAsync(reserved -> {
             if (!reserved) return CompletableFuture.completedFuture(OptionalLong.empty());
+            if (stopping) return delete(key, reservation).thenApply(removed -> OptionalLong.empty());
             long entity;
             try {
                 entity = shard.registerEntity(center(chunk));
@@ -58,6 +76,11 @@ public final class ChunkEntityDirectory {
                                 new IllegalStateException("Lost registration reservation for " + chunk) : failure;
                         return discardRegistration(key, reservation, entity, cause);
                     }).thenCompose(completion -> completion);
+        }, registration -> {
+            // A synchronous registration can deliver other StateStore callbacks before returning.
+            // During shutdown, run only the reservation cleanup branch above.
+            if (stopping) registration.run();
+            else registrations.add(registration);
         });
     }
 

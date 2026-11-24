@@ -123,29 +123,33 @@ still needs to start the Minecraft server, install the bridge, and drive
 session is ready and checks the serialized size against the effective RPC
 limit.
 
-## Run a one-node stack
+## Run the two-node stack
 
-Build matching AtlasNet Node, shard worker, GObject and Java bindings first.
-Set the Gradle properties below and point `JAVA_HOME` to JDK 25.
+Configure the root CMake preset with the Java-GI dependencies below and point
+`JAVA_HOME` to JDK 25. The stack target builds AtlasNet Node, the shard
+worker, GObject and Java bindings, Valkey, and the Minecraft modules.
 
 ```sh
-cmake -S . -B build -DATLASNET_MINECRAFT_HOST=ON
-cmake --build build --target atlasnet-minecraft-modules
+cmake --preset minecraft
+cmake --build build --target atlasnet-minecraft-stack
 ```
 
-The checked-in AtlasNet Local Stack profile runs the standard
-`AtlasNet/build/AtlasNetNode` executable. Its Minecraft group lists
+The checked-in AtlasNet Local Stack profile runs two instances of
+`build/AtlasNet/AtlasNetNode`, with one Minecraft shard worker per Node. Both groups load
 `libatlasnet-minecraft-shard.so`, `libatlasnet-minecraft-endpoint.so`,
 `libatlasnet-minecraft-admission.so`, and `libatlasnet-minecraft-spawn.so`
 from `build/host` in the Node's `modules` setting. The modules register
 through the standard AtlasNet module entry point and share a JVM per process.
-Shard-only Nodes need only the shard module. The group runs one Node
-with Database, ControllerEligible, Shard, and ClientIngress capabilities.
-The acceptance profile requests two Minecraft shards for one PostgreSQL-backed
-superflat world named `entity-acceptance`. It loads the `example.xsplit2d` module so authority crosses
-the X=0 plane, subject to AtlasNet's hysteresis. The loopback Control Panel
+Both Nodes load the `example.xsplit2d` module to validate the shared cluster
+configuration. The first Node runs the controller and hosts the Database
+capability backed by managed Valkey. The second Node bootstraps through the first.
+The loopback Control Panel
 can verify the player retains one AtlasNet EntityID while its shard changes.
-Existing `world` directories and their checkpoints are preserved. It uses managed Valkey and the `minecraft` ingress endpoint.
+
+Each `minecraft` ingress endpoint accepts an optional integer `args.port` from
+1 to 65535 and defaults to 25565. The profile sets the two ports explicitly to
+25565 and 25566. For example, `args: {port: 25566}` configures the second
+listener under `node.ingress-endpoints`.
 
 Set `ATLASNET_MINECRAFT_WORLD_DIR` before launching to choose the worker's
 primary server directory. It defaults to `minecraft-shard` relative to the
@@ -153,7 +157,8 @@ stack's working directory. Prepare it with your accepted Minecraft EULA and
 any existing vanilla world data. Additional workers reserve siblings such as
 `minecraft-shard-2` and inherit the primary directory's EULA acceptance when
 first created. Entity checkpoints use the same logical PostgreSQL world key. Edit `clusterSettings.application.minecraft.server-properties` in the Local Stack cluster settings and restart the stack to apply changes. The host uses vanilla property parsing. Admission uses the same compression and function permission settings as the shard, and the shard sends its configured view distance in vanilla Play packets. Online-mode authentication is required. Once
-the worker is ready, use Direct Connection to `localhost:25565` from a
+the workers are ready, use Direct Connection to `localhost:25565` or
+`localhost:25566` from a
 vanilla Minecraft 1.21.1 client signed in to a Minecraft account.
 
 The hosted server exposes the Overworld as the only gameplay destination.
@@ -170,6 +175,11 @@ full-chunk accessibility callback. The adapter delegates to the original
 listener and sends StateStore updates on the AtlasNet worker thread. A chunk
 that ceases to be accessible is removed from the set even if Minecraft still
 has a cached representation while unloading it.
+
+Chunk and ordinary entity registration run from the shard worker's regular poll
+handler after the StateStore reservation callback returns. AtlasNet's synchronous
+registration polls RPC while waiting for its reply. Deferring registration lets it
+receive other reservation completions without nesting registration calls.
 
 Membership describes which shards maintain a full chunk. It grants no
 authority to tick that chunk. On graceful shutdown, the worker submits
@@ -294,13 +304,14 @@ tick still need verification.
 ### What Run Stack builds
 
 The profile's **Prelaunch command** invokes `scripts/minecraft-build.sh stack`.
-It builds the configured AtlasNet Node, worker, generated Java bindings, and
-Valkey in `AtlasNet/build`, then builds the four Minecraft modules. It starts
-PostgreSQL after the builds succeed. Local Stack waits for the prelaunch command
+It configures the root `minecraft` preset and builds the
+`atlasnet-minecraft-stack` target in `build/`. The target builds the AtlasNet
+submodule and the four Minecraft modules in one CMake graph. The prelaunch
+starts PostgreSQL after the build succeeds. Local Stack waits for prelaunch
 before launching Valkey and the Node.
 
-The build picks JDK 25 and the Java-GI runtime JARs from the configured
-AtlasNet build when available. It can reuse the Mojang-mapped Minecraft
+The build passes the selected JDK 25 and Java-GI JARs from the root
+configuration to Gradle. It can reuse the Mojang-mapped Minecraft
 1.21.1 common JAR and server libraries from the local Fabric Loom cache.
 Set the Gradle properties below if you provision those dependencies elsewhere.
 An existing accepted EULA from the local legacy test server can seed a new
@@ -313,23 +324,26 @@ Docker must be accessible to the prelaunch task. PostgreSQL defaults to
 `ATLASNET_POSTGRES_DATABASE`, `ATLASNET_POSTGRES_USER`, and
 `ATLASNET_POSTGRES_PASSWORD`.
 
-The service uses a Docker volume named for this checkout. Set
-`ATLASNET_POSTGRES_VOLUME` to select a different volume. Local Stack runs the
+The service stores PostgreSQL data in `build/postgres/`. Set
+`ATLASNET_POSTGRES_VOLUME` to use a named Docker volume. Local Stack runs the
 prelaunch command once and has no corresponding shutdown command. To stop
 PostgreSQL after stopping the stack, run `scripts/minecraft-postgres.sh stop`.
-This removes the container and preserves the volume. Minecraft uses this
+This removes the container and preserves its data. Minecraft uses this
 database for entity checkpoints.
 
 ## Compile against the AtlasNet SDK
 
 Install JDK 25 for the Minecraft host and AtlasNet Java bindings, and JDK 21
-for Java 21 SDK targets. Build or obtain the generated `atlasnet-1.0.jar` from the matching AtlasNet
-checkout and provision the GLib and jspecify JARs used to build it. Follow the
-[AtlasNet Java build instructions](../AtlasNet/Integrations/Java/README.md).
+for Java 21 SDK targets. Install `g-ir-scanner` and `g-ir-compiler`, then
+provision the Java-GI generator and the GLib and jspecify JARs. The Java-GI
+1.0.0-RC3 GLib JAR includes Gio. Set
+`ATLASNET_JAVA_GI_EXECUTABLE` and `ATLASNET_JAVA_RUNTIME_JARS` on the
+Minecraft root configure command. The AtlasNet dependency generates its SDK
+JAR during the build. [AtlasNet Java build instructions](../AtlasNet/Integrations/Java/README.md)
 
-Set these Gradle properties in your Gradle user home's `gradle.properties`
-or use the corresponding `ORG_GRADLE_PROJECT_…` environment variables. This
-configuration works for both CMake and the Gradle wrapper:
+When running Gradle directly, set these properties in your Gradle user home's
+`gradle.properties` or use the corresponding `ORG_GRADLE_PROJECT_…`
+environment variables:
 
 ```properties
 atlasnetJavaSdkJar=/absolute/path/to/atlasnet-1.0.jar
@@ -337,7 +351,7 @@ atlasnetJavaGiGlibJar=/absolute/path/to/glib-1.0.0-RC3.jar
 atlasnetJavaJSpecifyJar=/absolute/path/to/jspecify-1.0.1.jar
 ```
 
-The first property defaults to `AtlasNet/build/Integrations/Java/atlasnet-1.0.jar`.
+The first property defaults to `build/AtlasNet/Integrations/Java/atlasnet-1.0.jar`.
 Set it explicitly when using another AtlasNet build directory. If Gradle
 cannot discover the installed JDKs, set `org.gradle.java.installations.paths`
 to their comma-separated installation paths. The default Minecraft build
@@ -350,8 +364,7 @@ server dependency JARs, such as the unpacked `META-INF/libraries` directory
 from the official 1.21.1 server bundle. The host must supply the same JARs at
 runtime. These dependencies are compile-only and are kept out of the module JARs.
 
-The dependencies are compile-only. The build does not generate bindings,
-initialize native code, or bundle dependency classes. Running a provider will require the
+The Java module JARs use compile-only dependencies. Running a provider requires the
 matching AtlasNet and Java-GI JARs, JDK 25, the same-build
 `libatlasnet-gobject.so` and its native dependencies, library search paths, and
 JVM native access configured as described in the upstream SDK instructions.

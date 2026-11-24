@@ -1,5 +1,7 @@
 package net.atlasnet.minecraft.endpoint;
 
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonParser;
 import java.io.EOFException;
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -50,9 +52,32 @@ public final class MinecraftTcpEndpoint {
                                 String admissionName, String spawnName, Consumer<IOException> startupFailure)
             throws GErrorException {
         registry.registerClientEndpoint(endpointName, (id, name, arguments) -> {
-            var listener = new Listener(bind, admissionName, spawnName, startupFailure);
-            return listener.endpoint;
+            try {
+                int port = configuredPort(arguments, bind.getPort());
+                var address = port == bind.getPort() ? bind : new InetSocketAddress(bind.getHostString(), port);
+                return new Listener(address, admissionName, spawnName, startupFailure).endpoint;
+            } catch (IllegalArgumentException | JsonParseException failure) {
+                LOG.log(System.Logger.Level.ERROR, "Invalid Minecraft endpoint '" + id + "' configuration: "
+                        + failure.getMessage());
+                return null;
+            }
         });
+    }
+
+    static int configuredPort(String arguments, int defaultPort) {
+        var options = JsonParser.parseString(arguments);
+        if (!options.isJsonObject()) throw new IllegalArgumentException("args must be an object");
+        var port = options.getAsJsonObject().get("port");
+        if (port == null) return defaultPort;
+        if (port.isJsonPrimitive() && port.getAsJsonPrimitive().isNumber()) {
+            try {
+                int value = Integer.parseInt(port.getAsString());
+                if (value >= 1 && value <= 65535) return value;
+            } catch (NumberFormatException ignored) {
+                // Fractional and out-of-range JSON numbers are invalid ports.
+            }
+        }
+        throw new IllegalArgumentException("args.port must be an integer from 1 to 65535");
     }
 
     private static final class Listener {
@@ -68,6 +93,7 @@ public final class MinecraftTcpEndpoint {
                     var opened = new ServerSocket();
                     server = opened;
                     opened.bind(bind);
+                    LOG.log(System.Logger.Level.INFO, "Minecraft endpoint listening on " + opened.getLocalSocketAddress());
                     workers.submit(() -> accept(opened, admission, spawn));
                 } catch (IOException failure) {
                     stop();

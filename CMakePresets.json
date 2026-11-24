@@ -1,0 +1,28 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "minecraft",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/AtlasNet/vcpkg-triplets/clang-toolchain.cmake",
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/AtlasNet/vcpkg-triplets",
+        "VCPKG_TARGET_TRIPLET": "x64-linux-clang",
+        "ATLASNET_MINECRAFT_HOST": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "server",
+      "configurePreset": "minecraft",
+      "targets": ["atlasnet-minecraft-stack"],
+      "jobs": 4
+    }
+  ]
+}

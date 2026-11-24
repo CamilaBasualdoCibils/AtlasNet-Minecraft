@@ -4,16 +4,9 @@ set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
-cache_value() {
-    if [[ -f "$root/AtlasNet/build/CMakeCache.txt" ]]; then
-        sed -n "s|^$1:[^=]*=||p" "$root/AtlasNet/build/CMakeCache.txt"
-    fi
-}
-
 select_jdk() {
-    local native_java candidate
-    native_java="$(cache_value Java_JAVA_EXECUTABLE)"
-    for candidate in "${JAVA_HOME:-}" "${native_java%/bin/java}" \
+    local candidate
+    for candidate in "${JAVA_HOME:-}" \
         "$root"/.tools/jdk-25* "$root"/legacy/.tools/jdk-25* /usr/lib/jvm/*; do
         if [[ -n "$candidate" && -x "$candidate/bin/javac" ]] &&
             grep -Eq '^JAVA_VERSION="25([.+"]|$)' "$candidate/release"; then
@@ -27,22 +20,7 @@ select_jdk() {
 }
 
 gradle_build() {
-    local glib jspecify path bundle
-    IFS=';' read -r -a runtime_jars <<< "$(cache_value ATLASNET_JAVA_RUNTIME_JARS)"
-    for path in "${runtime_jars[@]}"; do
-        case "${path##*/}" in
-            *glib*.jar) glib="$path" ;;
-            jspecify*.jar) jspecify="$path" ;;
-        esac
-    done
-    if [[ -f "${glib:-}" ]]; then
-        export ORG_GRADLE_PROJECT_atlasnetJavaGiGlibJar="${ORG_GRADLE_PROJECT_atlasnetJavaGiGlibJar:-$glib}"
-    fi
-    if [[ -f "${jspecify:-}" ]]; then
-        export ORG_GRADLE_PROJECT_atlasnetJavaJSpecifyJar="${ORG_GRADLE_PROJECT_atlasnetJavaJSpecifyJar:-$jspecify}"
-    fi
-
-    local loom
+    local loom path bundle
     for loom in "${GRADLE_USER_HOME:-$HOME/.gradle}/caches/fabric-loom" \
         "$root/legacy/.tools/gradle-home/caches/fabric-loom"; do
         if [[ -z "${ORG_GRADLE_PROJECT_minecraftAdmissionJar:-}" ]]; then
@@ -82,14 +60,13 @@ stack_build() {
     fi
 
     local jobs="${CMAKE_BUILD_PARALLEL_LEVEL:-4}"
-    if [[ "$(cache_value ATLASNET_JAVABINDINGS)" != ON ]]; then
-        printf 'Configure AtlasNet/build with ATLASNET_JAVABINDINGS=ON before launching.\n' >&2
+    if [[ -z "${VCPKG_ROOT:-}" ]]; then
+        printf 'Set VCPKG_ROOT to your vcpkg installation before launching.\n' >&2
         exit 1
     fi
-    GI_SCANNER_DISABLE_CACHE=1 cmake --build "$root/AtlasNet/build" --parallel "$jobs" \
-        --target AtlasNetNode AtlasNetShardWorker AtlasNetJava AtlasNetXAxisSplit Valkey-Server-Compile
-    cmake -S "$root" -B "$root/build" -DATLASNET_MINECRAFT_HOST=ON
-    cmake --build "$root/build" --parallel "$jobs" --target atlasnet-minecraft-modules
+    cmake --preset minecraft
+    GI_SCANNER_DISABLE_CACHE=1 cmake --build "$root/build" --parallel "$jobs" \
+        --target atlasnet-minecraft-stack
     exec "$root/scripts/minecraft-postgres.sh"
 }
 

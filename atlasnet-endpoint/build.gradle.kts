@@ -2,12 +2,17 @@ plugins {
     `java-library`
 }
 
+repositories { mavenCentral() }
+
 // Adds a direct compile-only dependency on the existing AtlasNet Java SDK.
 apply(from = rootProject.file("gradle/atlasnet-module.gradle.kts"))
 
 val transportTest by sourceSets.creating {
     compileClasspath += sourceSets.main.get().output
     runtimeClasspath += sourceSets.main.get().output
+}
+configurations.named(transportTest.implementationConfigurationName) {
+    extendsFrom(configurations.implementation.get(), configurations.compileOnly.get())
 }
 
 val checkTransport by tasks.registering(JavaExec::class) {
@@ -22,4 +27,5 @@ tasks.check {
 
 dependencies {
     implementation(project(":common:core"))
+    implementation("com.google.code.gson:gson:2.10.1")
 }
