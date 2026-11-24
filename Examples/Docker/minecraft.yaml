@@ -1,0 +1,25 @@
+node:
+  capabilities: [Database, ControllerEligible, Shard, ClientIngress]
+  bootstrap:
+    endpoints: ["tasks.manager:42001"]
+  network:
+    cluster_port: 42000
+    handshake_port: 42001
+  valkey:
+    uri: tcp://valkey:6379
+  modules:
+    - /atlasnet/AtlasNetXAxisSplit.so
+    - /atlasnet/libatlasnet-minecraft-shard.so
+    - /atlasnet/libatlasnet-minecraft-endpoint.so
+    - /atlasnet/libatlasnet-minecraft-admission.so
+    - /atlasnet/libatlasnet-minecraft-spawn.so
+  shards:
+    max_count: 1
+    cpu_request: 2
+    memory_request: 2GiB
+    worker_executable: /atlasnet/AtlasNetShardWorker
+  ingress-endpoints:
+    - id: minecraft
+      name: minecraft
+      args:
+        port: 25565

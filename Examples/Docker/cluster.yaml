@@ -1,0 +1,25 @@
+cluster:
+  spatialPlane: XZ
+  controller:
+    heuristic: example.xsplit2d
+    shards:
+      desired_count: 2
+  region_transfer:
+    mode: immediate
+    hysteresis_distance: 0
+  application:
+    minecraft:
+      terrain-enabled: true
+      server-properties:
+        motd: AtlasNet Minecraft
+        level-name: atlasnet-superflat
+        level-type: minecraft:normal
+        level-seed: atlasnet-docker
+        generator-settings: >-
+          {"biome":"minecraft:plains","features":false,"lakes":false,
+          "layers":[{"block":"minecraft:bedrock","height":1},
+          {"block":"minecraft:dirt","height":2},{"block":"minecraft:grass_block","height":1}],
+          "structure_overrides":"minecraft:villages"}
+        online-mode: true
+        view-distance: 6
+        simulation-distance: 6

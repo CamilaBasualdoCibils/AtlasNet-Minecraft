@@ -1,0 +1,105 @@
+version: "3.8"
+
+services:
+  valkey:
+    image: ${ATLASNET_VALKEY_IMAGE:-atlasnet-node-valkeymodule:latest}
+    # Use the Valkey server from the production image. The manager owns
+    # registry bootstrap, so skip the wrapper that starts an embedded Node.
+    entrypoint: ["/usr/local/bin/docker-entrypoint.sh"]
+    command: ["valkey-server", "--protected-mode", "no"]
+    networks: [cluster]
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+      restart_policy:
+        condition: any
+        delay: 5s
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: minecraft
+      POSTGRES_USER: minecraft
+      POSTGRES_PASSWORD: ${ATLASNET_POSTGRES_PASSWORD:-minecraft-dev}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [cluster]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "minecraft", "-d", "minecraft"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+      restart_policy:
+        condition: any
+        delay: 5s
+
+  manager:
+    image: ${MINECRAFT_NODE_IMAGE:-atlasnet-minecraft-node:latest}
+    entrypoint: ["/atlasnet/AtlasNetNode"]
+    environment:
+      ATLASNET_NODE_CONFIG: /etc/atlasnet/node.yaml
+      ATLASNET_CLUSTER_CONFIG: /etc/atlasnet/cluster.yaml
+    configs:
+      - source: manager-node-config
+        target: /etc/atlasnet/node.yaml
+      - source: minecraft-cluster-policy-v2
+        target: /etc/atlasnet/cluster.yaml
+    networks: [cluster]
+    ports:
+      - target: 8080
+        published: 8080
+        protocol: tcp
+        mode: ingress
+    stop_grace_period: 45s
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+      restart_policy:
+        condition: any
+        delay: 5s
+
+  minecraft:
+    image: ${MINECRAFT_NODE_IMAGE:-atlasnet-minecraft-node:latest}
+    environment:
+      ATLASNET_NODE_CONFIG: /etc/atlasnet/node.yaml
+      ATLASNET_MINECRAFT_WORLD_DIR: /atlasnet/minecraft-shard
+      ATLASNET_POSTGRES_PORT: "45432"
+      ATLASNET_POSTGRES_PASSWORD: ${ATLASNET_POSTGRES_PASSWORD:-minecraft-dev}
+      MINECRAFT_EULA: ${MINECRAFT_EULA:-false}
+    configs:
+      - source: minecraft-node
+        target: /etc/atlasnet/node.yaml
+    networks: [cluster]
+    ports:
+      - target: 25565
+        published: 25565
+        protocol: tcp
+        mode: ingress
+    stop_grace_period: 45s
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: any
+        delay: 5s
+
+networks:
+  cluster:
+    driver: overlay
+
+volumes:
+  valkey-data:
+  postgres-data:
+
+configs:
+  manager-node-config:
+    file: ./manager.yaml
+  minecraft-node:
+    file: ./minecraft.yaml
+  minecraft-cluster-policy-v2:
+    file: ./cluster.yaml

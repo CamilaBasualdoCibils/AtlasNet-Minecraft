@@ -1,0 +1,12 @@
+node:
+  capabilities: [Database, ControlPanel]
+  network:
+    cluster_port: 42000
+    handshake_port: 42001
+  valkey:
+    uri: tcp://valkey:6379
+  # Database nodes validate the shared heuristic when loading cluster policy.
+  modules: [/atlasnet/AtlasNetXAxisSplit.so]
+  control_panel:
+    address: 0.0.0.0
+    port: 8080
